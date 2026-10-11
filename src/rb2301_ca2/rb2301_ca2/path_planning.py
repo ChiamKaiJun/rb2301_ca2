@@ -427,8 +427,9 @@ class WaypointNode(Node):
 
         # Our own arguemnt
         self.is_simulation = is_simulation
-        self.planning_attempted = False  # Plan once while testing
+        self.plan_new_path = True  # Flag to start path planning
         self.goal_idx = 0
+        self.waypoints = []
 
         # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
         if self.is_simulation:
@@ -537,7 +538,7 @@ class WaypointNode(Node):
         '''Set new waypoints when a goal has been reached'''
         self.goal_reached = False
         self.waypoints = waypoints
-        self.current_waypoint_idx = 0
+        
 
     def timer_callback(self):
         """Controller loop. Insert path planning and PID control logic here"""
@@ -560,8 +561,8 @@ class WaypointNode(Node):
 
         ###### INSERT CODE HERE ######
         # Plan with A* and Generate Waypoints for each goal
-        if not self.planning_attempted:
-            self.planning_attempted = True
+        if self.plan_new_path:
+            self.plan_new_path = False # Do not plan new plan until goal has been reached
             self.move_2D()
 
             # Convert the current robot position into a grid cell.
@@ -579,25 +580,20 @@ class WaypointNode(Node):
 
             # PLAN A* ROUTE
             route = astar(self.map_array, start, goal)
-
             if route is None:
                 self.get_logger().error(
                     f"No route found: {start} -> {goal}"
                 )
             else:
-                # Route finds!
-                # The existing map-printing condition detects this change
-                # and displays the route on the next timer callback.
+                # Route found!
                 self.path = route
-
+                self.waypoints = get_turn_waypoints(route)
                 self.get_logger().info(
-                    f"Route to Goal {goal_x,goal_y} found! {len(route) - 1} steps"
+                    f"Route to Goal {goal_x,goal_y} found! {len(route) - 1} steps, "
+                    f"{len(self.path)} simplified waypoints"
                 )
 
-                # Set goal index to next!
-                self.goal_idx += 1
-                if self.goal_idx == len(self.goal_list): #reach end of list:
-                    self.get_logger().info(f"On route to Last Goal!")
+                self.current_waypoint_idx = 1 if len(self.waypoints) > 1 else 0 # Initialise waypoint
 
                 # REMOVE UNNESCESSARY waypoints Keep only the start, turn cells and endpoint for tracking.
                 # waypoint_cells = get_turn_waypoints(self.path)
@@ -616,31 +612,92 @@ class WaypointNode(Node):
                 #     *robot_world, self.origin, self.resolution
                 # )
         
-        foward = 1.0
-        rotate = 1.2
-        # Robot grid position
-        robot_world = tuple(self.pose[:2])
-        robot_grid = world_to_grid(
-            robot_world, self.origin, self.resolution
+        ####################################
+
+        # Complete WayPoints
+
+        # Wait until we have a robot pose and a planned path.
+        if self.pose is None or not self.waypoints:
+            self.move_2D()
+            return
+
+        # Stop when all waypoints have been reached.
+        if self.current_waypoint_idx >= len(self.path):
+            self.move_2D()
+            return
+
+        # Get the grid cell we are currently trying to reach.
+        target_cell = self.waypoints[self.current_waypoint_idx]
+
+        # Check whether BOTH x and y are within 5 cm of its centre.
+        if has_reached_grid(
+            self.pose,
+            target_cell,
+            self.origin,
+            self.resolution,
+            tolerance=0.05,
+        ):
+            self.current_waypoint_idx += 1
+            self.move_2D()  # Stop briefly before checking the next waypoint.
+
+            # Last waypoint reached
+            if self.current_waypoint_idx >= len(self.waypoints):
+                if self.goal_idx == len(self.goal_list) - 1:
+                # Last goal reached: keep the goal index unchanged.
+                    self.plan_new_path = False
+                    self.get_logger().info("All goals reached!")
+                else:
+                    # Another goal remains. Plan its route next callback.
+                    self.goal_idx += 1
+                    self.plan_new_path = True
+            return
+
+        # Convert the target cell into world coordinates.
+        target_x, target_y = grid_to_world(
+            *target_cell, self.origin, self.resolution
         )
 
-        # Robot to move towards next waypoint 
-        self.curr_waypoint_idx += 1 # idx of waypoint
-        # check if direction same as prev
-        if self.path[self.current_waypoint_idx-1] == 
+        # Find the direction from the robot to the target.
+        desired_heading = np.arctan2(
+            target_y - self.pose[1],
+            target_x - self.pose[0],
+        )
 
+        # Find the shortest angle to turn, in radians.
+        heading_error = wrap_angle(
+            desired_heading - np.deg2rad(self.pose[2])
+        )
 
-        if self.current_waypoint_idx == len(self.path): # check if it reached last waypoint
-            self.get_logger().info(f"Reaching last waypoint")
-            # Plan for new goal!
-            self.planning_attempted = False
-            self.current_waypoint_idx = 0 # Reset
+        # Fixed speeds: no PID.
+        forward_speed = 1.0
+        turn_speed = 1.5 if self.is_simulation else 0.4
+        heading_tolerance = np.deg2rad(0.3)
 
-        # check if robot is within 5cm of cell centre
-        has_reached_grid(self.pose, grid_to_world(self.path[self.current_waypoint_idx], self.origin,
-                     resolution=occupancy_grid_resolution, tolerance=0.05))
+        if abs(heading_error) > heading_tolerance:
+            mode = "TURN"
+            forward = 0.0
+            turn = turn_speed if heading_error > 0 else -turn_speed
+        else:
+            mode = "DRIVE"
+            forward = forward_speed
+            turn = 0.0
 
-        
+        self.get_logger().info(
+            f"{mode} | "
+            f"goal={self.goal_idx + 1}/{len(self.goal_list)} | "
+            f"waypoint={self.current_waypoint_idx + 1}/{len(self.waypoints)} | "
+            f"target={target_cell} | "
+            f"dx={target_x - self.pose[0]:.3f} m | "
+            f"dy={target_y - self.pose[1]:.3f} m | "
+            f"yaw={self.pose[2]:.1f} deg | "
+            f"desired={np.rad2deg(desired_heading):.1f} deg | "
+            f"error={np.rad2deg(heading_error):.1f} deg | "
+            f"forward={forward:.2f} m/s | "
+            f"turn={turn:.2f} rad/s\n",
+            throttle_duration_sec=1.0,
+        )
+
+        self.move_2D(x=forward, y=0.0, turn=turn)
 
         
 
