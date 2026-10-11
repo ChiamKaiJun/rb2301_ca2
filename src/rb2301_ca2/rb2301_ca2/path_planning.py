@@ -134,6 +134,289 @@ def load_irl_config(run:str) -> dict:
         "max_translate_velocity": 0.4, # Please keep this in place
     }
 
+# OUR GROUP'S ASTAR ALGO
+def heuristic(cell, goal):
+    """Manhattan distance for four-direction movement."""
+    return abs(cell[0] - goal[0]) + abs(cell[1] - goal[1])
+
+def astar(grid, start, goal):
+    """Return a shortest grid path from start to goal, or None."""
+    rows, cols = grid.shape
+
+    def is_free(cell):
+        i, j = cell
+        # Check bounds first; negative NumPy indices wrap around.
+        return (
+            0 <= i < rows
+            and 0 <= j < cols
+            and grid[i, j] == 0
+        )
+
+    if not is_free(start) or not is_free(goal):
+        return None
+
+    open_set = {start}   # Discovered cells waiting for expansion
+    closed_set = set()   # Cells already expanded
+    g = {start: 0}       # Best known cost from start to each cell
+    parent = {}         # Previous cell on the best known route
+
+    directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+    while open_set:
+        # Select the cell with the lowest total estimated cost.
+        current = min(
+            open_set,
+            key=lambda cell: g[cell] + heuristic(cell, goal)
+        )
+        open_set.remove(current)
+
+        if current == goal:
+            # Follow parents from goal to start, then reverse.
+            path = [current]
+            while current != start:
+                current = parent[current]
+                path.append(current)
+            return path[::-1]
+
+        closed_set.add(current)
+
+        for di, dj in directions:
+            neighbour = (current[0] + di, current[1] + dj)
+
+            if not is_free(neighbour) or neighbour in closed_set:
+                continue
+
+            # One horizontal or vertical step costs 1.
+            new_g = g[current] + 1
+
+            # Compare the incoming direction (previous → current) with the
+            # outgoing direction (current → neighbour). Skip the starting cell.
+            if current in parent and (di, dj) != (current[0] - parent[current][0], current[1] - parent[current][1]):
+                # Penalise direction changes to favour paths with fewer turns.
+                new_g += 0.1
+
+            # Update if this route is cheaper.
+            # Undiscovered cells have a default cost of infinity.
+            if new_g < g.get(neighbour, float("inf")):
+                g[neighbour] = new_g
+                parent[neighbour] = current
+                open_set.add(neighbour)
+
+    return None  # No route exists
+
+# OUR GROUP'S PID HELPER FUNCTIONS
+def get_lookahead_target(robot_xy, segment_start, segment_end,
+                         lookahead_distance=0.4):
+    """
+    Find:
+        projection: closest point on the CURRENT segment to the robot
+        target: point a fixed distance ahead of that projection
+
+    The target cannot go beyond the segment endpoint.
+
+    Inputs:
+        robot_xy: robot position (x, y), in metres
+        segment_start: start of the current segment (x, y)
+        segment_end: end of the current segment (x, y)
+        lookahead_distance: distance ahead of the projection, in metres
+
+    Returns:
+        projection, target — both NumPy arrays containing [x, y]
+    """
+
+    # Convert positions into NumPy arrays so vector subtraction works.
+    robot = np.asarray(robot_xy, dtype=float)
+    start = np.asarray(segment_start, dtype=float)
+    end = np.asarray(segment_end, dtype=float)
+
+    # Vector pointing from the segment start to its end.
+    # Example: start=(1, 2), end=(4, 2) gives segment=[3, 0].
+    segment = end - start
+
+    # Calculate the segment's physical length using sqrt(dx² + dy²).
+    length = np.linalg.norm(segment)
+
+    # If start and end are identical, there is no direction to calculate.
+    # Avoid dividing by zero. The tracking code should skip this segment.
+    if length < 1e-9:
+        return start.copy(), end.copy()
+
+    # Divide by length to get a UNIT direction vector.
+    # Its length is 1, so multiplying it by 0.4 moves 0.4 metres.
+    direction = segment / length
+
+    # Vector from the segment start to the robot.
+    start_to_robot = robot - start
+
+    # Project this vector onto the segment direction using a dot product.
+    # The result is a DISTANCE along the segment, measured from its start.
+    #
+    # Example:
+    #   Segment: (0, 0) -> (5, 0), direction=[1, 0]
+    #   Robot: (2, 0.2)
+    #   Dot product: [2, 0.2] · [1, 0] = 2 metres
+    projected_distance = np.dot(start_to_robot, direction)
+
+    # Keep the projection inside the segment:
+    #   Below 0      -> use the start
+    #   Above length -> use the end
+    projected_distance = np.clip(projected_distance, 0.0, length)
+
+    # Convert the distance along the segment back into an (x, y) position.
+    projection = start + projected_distance * direction
+
+    # Move the target ahead of the projection.
+    # max() prevents a negative lookahead from placing it behind.
+    target_distance = projected_distance + max(0.0, lookahead_distance)
+
+    # Cap the target at the endpoint so we do not look around the corner.
+    target_distance = min(target_distance, length)
+
+    # Convert the target distance into its world-coordinate position.
+    target = start + target_distance * direction
+
+    #projection: the closest point on the current segment to the robot.
+    #target: the lookahead point ahead of that projection, capped at the endpoint.
+    return projection, target
+
+def wrap_angle(angle):
+    """Wrap a RADIAN angle to [-pi, pi), giving the shortest turn."""
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+def get_heading_error(robot_pose, target):
+    """
+    robot_pose: [x, y, heading_in_DEGREES], as stored in self.pose
+    target: [x, y] in WORLD coordinates
+
+    Returns the heading error in RADIANS.
+    """
+
+    # Calculate the direction from the robot toward the target.
+    dx = target[0] - robot_pose[0]
+    dy = target[1] - robot_pose[1]
+
+    # atan2 handles all quadrants and returns an angle in radians.
+    desired_heading = np.arctan2(dy, dx)
+
+    # Convert the supplied robot heading from degrees to radians.
+    current_heading = np.deg2rad(robot_pose[2])
+
+    # Positive error: turn anticlockwise.
+    # Negative error: turn clockwise.
+    return wrap_angle(desired_heading - current_heading)
+
+# PID CLASS
+class HeadingPID:
+    """Calculate angular velocity from heading error."""
+
+    def __init__(self, kp=2.0, ki=0.0, kd=0.0,
+                 max_turn=1.0, integral_limit=0.5):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+
+        self.max_turn = max_turn
+        self.integral_limit = integral_limit
+
+        self.reset()
+
+    def reset(self):
+        """Clear controller history."""
+        self.integral = 0.0
+        self.previous_error = None
+
+    def update(self, error, dt):
+        """Return angular velocity in rad/s from heading error in radians."""
+
+        if dt <= 0.0:
+            return 0.0
+
+        # P: respond to the current heading error.
+        proportional = self.kp * error
+
+        # I: accumulate error over time
+        if self.ki != 0.0:
+            self.integral += error * dt
+            # Limits excessive accumulation!!
+            self.integral = np.clip(
+                self.integral,
+                -self.integral_limit,
+                self.integral_limit
+            )
+
+        integral_term = self.ki * self.integral
+
+        # D: calculate how quickly the error changes.
+        # On the first update, there is no previous error to compare.
+        derivative = 0.0
+        if self.previous_error is not None:
+            error_change = wrap_angle(error - self.previous_error)
+            derivative = error_change / dt
+
+        # Save this error for the NEXT update.
+        self.previous_error = error
+
+        # Combine all three contributions.
+        turn = proportional + integral_term + self.kd * derivative
+
+        # Cap angular velocity in both directions.
+        return float(np.clip(turn, -self.max_turn, self.max_turn))
+
+# Checker if it reached grid
+def has_reached_grid(robot_pose, target_cell, origin,
+                     resolution=occupancy_grid_resolution, tolerance=0.05) -> bool:
+    """Return True when BOTH x and y are within tolerance of the cell centre.
+
+    robot_pose: world [x, y] or [x, y, heading]; None means no pose yet.
+    target_cell: grid indices (i, j). Tolerance is in metres, inclusive.
+    This checks a square around the centre, not a circular distance.
+    """
+    if tolerance < 0:
+        raise ValueError("tolerance must be non-negative")
+    if robot_pose is None:
+        return False
+
+    centre_x, centre_y = grid_to_world(*target_cell, origin, resolution)
+    return bool(
+        abs(robot_pose[0] - centre_x) <= tolerance
+        and abs(robot_pose[1] - centre_y) <= tolerance
+    )
+
+# SIMPLIFY Waypoints
+def get_turn_waypoints(path):
+    """Keep the start, every direction-change cell, and the end."""
+
+    # Empty, one-cell, and two-cell paths need no simplification.
+    if len(path) <= 2:
+        return list(path)
+
+    waypoints = [path[0]]
+
+    # Inspect each cell that has both a previous and a next cell.
+    for i in range(1, len(path) - 1):
+        previous = path[i - 1]
+        current = path[i]
+        following = path[i + 1]
+
+        # Direction taken to ENTER the current cell.
+        incoming = (
+            current[0] - previous[0],
+            current[1] - previous[1]
+        )
+
+        # Direction taken to LEAVE the current cell.
+        outgoing = (
+            following[0] - current[0],
+            following[1] - current[1]
+        )
+
+        # Same direction: current lies within a straight run; skip it.
+        # Different direction: current is a turn point; keep it.
+        if incoming != outgoing:
+            waypoints.append(current)
+
+    waypoints.append(path[-1])
+    return waypoints
 
 class WaypointNode(Node):
     '''Node to calculate path and move robot towards given goal_coordinates, using pose info from either gazebo odometer or optitrack'''
@@ -142,7 +425,10 @@ class WaypointNode(Node):
         super().__init__('waypoint')
         self.get_logger().info("Starting WaypointNode")
 
+        # Our own arguemnt
         self.is_simulation = is_simulation
+        self.planning_attempted = False  # Plan once while testing
+        self.goal_idx = 0
 
         # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
         if self.is_simulation:
@@ -210,6 +496,7 @@ class WaypointNode(Node):
         goal_cells = [clip(world_to_grid(gx, gy, self.origin, self.resolution)) for gx, gy in self.goal_list]
         grid = Grid(self.map_array, starting_position=current_cell, goal_position=goal_cells[-1])
         grid.print_grid_map(waypoints=goal_cells, path=self.path)
+        grid.draw_grid_map(waypoints=goal_cells, path=self.path)
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -272,7 +559,91 @@ class WaypointNode(Node):
             self._last_printed_path = list(self.path)
 
         ###### INSERT CODE HERE ######
-        self.move_2D(0.5)
+        # Plan with A* and Generate Waypoints for each goal
+        if not self.planning_attempted:
+            self.planning_attempted = True
+            self.move_2D()
+
+            # Convert the current robot position into a grid cell.
+            start = world_to_grid(
+                self.pose[0], self.pose[1],
+                self.origin, self.resolution
+            )
+
+            # Choose current goal, corvet into grid coordinates
+            goal_x, goal_y = self.goal_list[self.goal_idx]
+            goal = world_to_grid(
+                goal_x, goal_y,
+                self.origin, self.resolution
+            )
+
+            # PLAN A* ROUTE
+            route = astar(self.map_array, start, goal)
+
+            if route is None:
+                self.get_logger().error(
+                    f"No route found: {start} -> {goal}"
+                )
+            else:
+                # Route finds!
+                # The existing map-printing condition detects this change
+                # and displays the route on the next timer callback.
+                self.path = route
+
+                self.get_logger().info(
+                    f"Route to Goal {goal_x,goal_y} found! {len(route) - 1} steps"
+                )
+
+                # Set goal index to next!
+                self.goal_idx += 1
+                if self.goal_idx == len(self.goal_list): #reach end of list:
+                    self.get_logger().info(f"On route to Last Goal!")
+
+                # REMOVE UNNESCESSARY waypoints Keep only the start, turn cells and endpoint for tracking.
+                # waypoint_cells = get_turn_waypoints(self.path)
+
+                # # Convert those grid cells into world coordinates in metres.
+                # self.waypoints = [
+                #     grid_to_world(i, j, self.origin, self.resolution)
+                #     for i, j in waypoint_cells
+                # ]
+
+                # # Print once after planning, so we can check the conversion.
+                # self.get_logger().info(f"Waypoint cells {len(waypoint_cells)} steps")
+
+                # robot_world = tuple(self.pose[:2])
+                # robot_grid = world_to_grid(
+                #     *robot_world, self.origin, self.resolution
+                # )
+        
+        foward = 1.0
+        rotate = 1.2
+        # Robot grid position
+        robot_world = tuple(self.pose[:2])
+        robot_grid = world_to_grid(
+            robot_world, self.origin, self.resolution
+        )
+
+        # Robot to move towards next waypoint 
+        self.curr_waypoint_idx += 1 # idx of waypoint
+        # check if direction same as prev
+        if self.path[self.current_waypoint_idx-1] == 
+
+
+        if self.current_waypoint_idx == len(self.path): # check if it reached last waypoint
+            self.get_logger().info(f"Reaching last waypoint")
+            # Plan for new goal!
+            self.planning_attempted = False
+            self.current_waypoint_idx = 0 # Reset
+
+        # check if robot is within 5cm of cell centre
+        has_reached_grid(self.pose, grid_to_world(self.path[self.current_waypoint_idx], self.origin,
+                     resolution=occupancy_grid_resolution, tolerance=0.05))
+
+        
+
+        
+
         ###### INSERT CODE HERE ######
 
 
