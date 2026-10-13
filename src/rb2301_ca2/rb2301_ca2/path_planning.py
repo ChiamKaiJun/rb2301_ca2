@@ -204,81 +204,6 @@ def astar(grid, start, goal):
 
     return None  # No route exists
 
-# OUR GROUP'S PID HELPER FUNCTIONS
-def get_lookahead_target(robot_xy, segment_start, segment_end,
-                         lookahead_distance=0.4):
-    """
-    Find:
-        projection: closest point on the CURRENT segment to the robot
-        target: point a fixed distance ahead of that projection
-
-    The target cannot go beyond the segment endpoint.
-
-    Inputs:
-        robot_xy: robot position (x, y), in metres
-        segment_start: start of the current segment (x, y)
-        segment_end: end of the current segment (x, y)
-        lookahead_distance: distance ahead of the projection, in metres
-
-    Returns:
-        projection, target — both NumPy arrays containing [x, y]
-    """
-
-    # Convert positions into NumPy arrays so vector subtraction works.
-    robot = np.asarray(robot_xy, dtype=float)
-    start = np.asarray(segment_start, dtype=float)
-    end = np.asarray(segment_end, dtype=float)
-
-    # Vector pointing from the segment start to its end.
-    # Example: start=(1, 2), end=(4, 2) gives segment=[3, 0].
-    segment = end - start
-
-    # Calculate the segment's physical length using sqrt(dx² + dy²).
-    length = np.linalg.norm(segment)
-
-    # If start and end are identical, there is no direction to calculate.
-    # Avoid dividing by zero. The tracking code should skip this segment.
-    if length < 1e-9:
-        return start.copy(), end.copy()
-
-    # Divide by length to get a UNIT direction vector.
-    # Its length is 1, so multiplying it by 0.4 moves 0.4 metres.
-    direction = segment / length
-
-    # Vector from the segment start to the robot.
-    start_to_robot = robot - start
-
-    # Project this vector onto the segment direction using a dot product.
-    # The result is a DISTANCE along the segment, measured from its start.
-    #
-    # Example:
-    #   Segment: (0, 0) -> (5, 0), direction=[1, 0]
-    #   Robot: (2, 0.2)
-    #   Dot product: [2, 0.2] · [1, 0] = 2 metres
-    projected_distance = np.dot(start_to_robot, direction)
-
-    # Keep the projection inside the segment:
-    #   Below 0      -> use the start
-    #   Above length -> use the end
-    projected_distance = np.clip(projected_distance, 0.0, length)
-
-    # Convert the distance along the segment back into an (x, y) position.
-    projection = start + projected_distance * direction
-
-    # Move the target ahead of the projection.
-    # max() prevents a negative lookahead from placing it behind.
-    target_distance = projected_distance + max(0.0, lookahead_distance)
-
-    # Cap the target at the endpoint so we do not look around the corner.
-    target_distance = min(target_distance, length)
-
-    # Convert the target distance into its world-coordinate position.
-    target = start + target_distance * direction
-
-    #projection: the closest point on the current segment to the robot.
-    #target: the lookahead point ahead of that projection, capped at the endpoint.
-    return projection, target
-
 def wrap_angle(angle):
     """Wrap a RADIAN angle to [-pi, pi), giving the shortest turn."""
     return (angle + np.pi) % (2.0 * np.pi) - np.pi
@@ -306,61 +231,6 @@ def get_heading_error(robot_pose, target):
     return wrap_angle(desired_heading - current_heading)
 
 # PID CLASS
-class HeadingPID:
-    """Calculate angular velocity from heading error."""
-
-    def __init__(self, kp=2.0, ki=0.0, kd=0.0,
-                 max_turn=1.0, integral_limit=0.5):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-
-        self.max_turn = max_turn
-        self.integral_limit = integral_limit
-
-        self.reset()
-
-    def reset(self):
-        """Clear controller history."""
-        self.integral = 0.0
-        self.previous_error = None
-
-    def update(self, error, dt):
-        """Return angular velocity in rad/s from heading error in radians."""
-
-        if dt <= 0.0:
-            return 0.0
-
-        # P: respond to the current heading error.
-        proportional = self.kp * error
-
-        # I: accumulate error over time
-        if self.ki != 0.0:
-            self.integral += error * dt
-            # Limits excessive accumulation!!
-            self.integral = np.clip(
-                self.integral,
-                -self.integral_limit,
-                self.integral_limit
-            )
-
-        integral_term = self.ki * self.integral
-
-        # D: calculate how quickly the error changes.
-        # On the first update, there is no previous error to compare.
-        derivative = 0.0
-        if self.previous_error is not None:
-            error_change = wrap_angle(error - self.previous_error)
-            derivative = error_change / dt
-
-        # Save this error for the NEXT update.
-        self.previous_error = error
-
-        # Combine all three contributions.
-        turn = proportional + integral_term + self.kd * derivative
-
-        # Cap angular velocity in both directions.
-        return float(np.clip(turn, -self.max_turn, self.max_turn))
 
 # Checker if it reached grid
 def has_reached_grid(robot_pose, target_cell, origin,
@@ -430,11 +300,28 @@ class WaypointNode(Node):
         self.plan_new_path = True  # Flag to start path planning
         self.goal_idx = 0
         self.waypoints = []
+        
+        # Controller Settings
+        self.lookahead_cells = 2
+        self.waypoint_path_indices = []
+        self.progress_idx = 0
 
-        # Movement Parameters
-        self.forward_speed = 1.0 if self.is_simulation else 0.4
-        self.turn_speed = 1.5 if self.is_simulation else 0.4
+        # Start with logging only. Set False after checking target selection.
+        self.tracking_test_only = False
+
+        # Remember whether lateral correction is active.
+        self.correcting_lateral = False  
+
+        # Controller settings — conservative starting values.
+        self.mode = "ALIGN"
+        self.forward_speed = 0.50           # Maximum forward speed, m/s.
+        self.turn_speed = 2.8 if self.is_simulation else 0.4
+        self.min_turn_speed = 1.5 if self.is_simulation else 0.0
         self.heading_tolerance = np.deg2rad(0.3)
+        self.heading_kp = 3.5
+        self.distance_kp = 1.5
+        self.realign_angle = np.deg2rad(30.0)
+
 
         # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
         if self.is_simulation:
@@ -501,8 +388,8 @@ class WaypointNode(Node):
         current_cell = clip(world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution))
         goal_cells = [clip(world_to_grid(gx, gy, self.origin, self.resolution)) for gx, gy in self.goal_list]
         grid = Grid(self.map_array, starting_position=current_cell, goal_position=goal_cells[-1])
-        grid.print_grid_map(waypoints=goal_cells, path=self.path)
-        grid.draw_grid_map(waypoints=goal_cells, path=self.path)
+        #grid.print_grid_map(waypoints=goal_cells, path=self.path)
+        grid.draw_grid_map(waypoints=self.waypoints, path=self.path)
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -551,17 +438,11 @@ class WaypointNode(Node):
         self.move_2D()
 
         # Convert the current robot position into a grid cell.
-        start = world_to_grid(
-            self.pose[0], self.pose[1],
-            self.origin, self.resolution
-        )
+        start = world_to_grid(self.pose[0], self.pose[1],self.origin, self.resolution)
 
         # Choose current goal, convert into grid coordinates
         goal_x, goal_y = self.goal_list[self.goal_idx]
-        goal = world_to_grid(
-            goal_x, goal_y,
-            self.origin, self.resolution
-        )
+        goal = world_to_grid(goal_x, goal_y,self.origin, self.resolution)
 
         # PLAN A* ROUTE
         route = astar(self.map_array, start, goal)
@@ -573,6 +454,9 @@ class WaypointNode(Node):
             # Route found!
             self.path = route
             self.waypoints = get_turn_waypoints(route) # Navigate using only the start, corners, and endpoint.
+            self.waypoint_path_indices = [self.path.index(cell) for cell in self.waypoints] # Link each corner/endpoint to its position in the full path.
+            self.progress_idx = 0
+            self.mode = "ALIGN"
             self.get_logger().info(
                 f"Route to Goal {goal_x,goal_y} found! {len(route) - 1} steps, "
                 f"{len(self.waypoints)} simplified waypoints"
@@ -580,22 +464,138 @@ class WaypointNode(Node):
             #  Initialise waypointskip the starting cell unless it is the only cell in the route.
             self.current_waypoint_idx = 1 if len(self.waypoints) > 1 else 0 
 
+    def get_lookahead_info(self):
+        """Use the full path for lookahead and simplified waypoints for corners."""
+        waypoint_idx = self.current_waypoint_idx
 
-    def calculate_motion(self, heading_error):
-        """Choose a mode and velocities from the heading error."""
-        if abs(heading_error) > self.heading_tolerance:
-            mode = "TURN"
-            forward = 0.0
-            turn = self.turn_speed if heading_error > 0 else -self.turn_speed
+        lateral_error = 0.0  # Signed distance from the current segment; metres.
+
+        end_idx = self.waypoint_path_indices[waypoint_idx]
+        start_idx = self.waypoint_path_indices[max(0, waypoint_idx - 1)]
+
+        start = np.array(grid_to_world(
+            *self.path[start_idx], self.origin, self.resolution
+        ))
+        end = np.array(grid_to_world(
+            *self.path[end_idx], self.origin, self.resolution
+        ))
+
+        robot = self.pose[:2]
+        segment = end - start
+        length = np.linalg.norm(segment)
+
+        if length > 1e-9:
+            direction = segment / length
+
+            offset = robot - start
+            lateral_error = direction[0] * offset[1] - direction[1] * offset[0]
+
+            # Progress depends on movement along the line, not sideways movement.
+            distance_along = float(np.clip(
+                np.dot(robot - start, direction),
+                0.0,
+                length,
+            ))
+
+            closest_point = start + distance_along * direction
+
+            # Count cell centres passed along this straight segment.
+            steps = int(np.floor(
+                distance_along / self.resolution + 1e-9
+            ))
+
+            # Keep progress in order and within the current segment.
+            self.progress_idx = min(
+                end_idx,
+                max(start_idx, self.progress_idx, start_idx + steps),
+            )
         else:
-            mode = "DRIVE"
-            forward = self.forward_speed
-            turn = 0.0
+            # One-cell route: approach that cell's centre directly.
+            closest_point = robot.copy()
+            self.progress_idx = end_idx
 
-        return mode, forward, turn
+        # Look two cells ahead, but never beyond the next corner.
+        lookahead_idx = min(
+            self.progress_idx + self.lookahead_cells,
+            end_idx,
+        )
+
+        target = np.array(grid_to_world(
+            *self.path[lookahead_idx], self.origin, self.resolution
+        ))
+
+        # Heading correction points from the robot toward the target.
+        delta = target - robot
+        heading_error = 0.0
+
+        if np.linalg.norm(delta) > 1e-9:
+            if abs(lateral_error) >= 0.03:
+                self.correcting_lateral = True
+            elif abs(lateral_error) <= 0.02:
+                self.correcting_lateral = False
+
+            # Aim at the lookahead when correcting or approaching the endpoint.
+            use_lookahead = self.correcting_lateral or lookahead_idx == end_idx
+            # If not correcting or reaching endpoint, follow direction of segment
+            desired_heading = np.arctan2(delta[1], delta[0]) if use_lookahead else np.arctan2(segment[1], segment[0])
+
+            # Shortest turn from current heading: positive anticlockwise, negative clockwise.
+            heading_error = wrap_angle(
+                desired_heading - np.deg2rad(self.pose[2])
+            )
+
+        return {
+            "heading_error": float(heading_error),
+            "distance_to_lookahead": float(
+                np.linalg.norm(target - robot)
+            ),
+            "cell_number": self.progress_idx - start_idx + 1,
+            "cell_count": end_idx - start_idx + 1,
+            "lookahead": use_lookahead,
+            "lateral_error": float(lateral_error)
+        }
+
+    def calculate_motion(self, heading_error, distance_to_lookahead):
+        """Forward P control uses the distance from the robot to the lookahead target."""
+
+        # ALIGN finishes at a small error.
+        # DRIVE only returns to ALIGN if the error becomes large.
+        if self.mode == "ALIGN":
+            if abs(heading_error) <= self.heading_tolerance:
+                self.mode = "DRIVE"
+        elif abs(heading_error) >= self.realign_angle:
+            self.mode = "ALIGN"
+
+        # Heading P controller.
+        turn = self.heading_kp * heading_error
+
+        if abs(heading_error) <= self.heading_tolerance:
+            turn = 0.0
+        else:
+            # Simulation workaround: preserve direction when boosting small turns.
+            turn = np.copysign(max(abs(turn), self.min_turn_speed), turn)  # Boost small turns while preserving direction.
+            turn = float(np.clip(turn, -self.turn_speed, self.turn_speed))  # Keep the maximum speed limit.
+        forward = 0.0
+
+        if self.mode == "DRIVE":
+            # Forward P controller: closest point to lookahead target.
+            forward = min(
+                self.forward_speed,
+                self.distance_kp * distance_to_lookahead,
+            )
+
+            # Reduce forward movement while correcting heading.
+            forward *= max(0.0, np.cos(heading_error))
+
+            # Temporary simulation test: determine whether low forward commands cause the stall.
+            if self.is_simulation:
+                forward = min(self.forward_speed, max(forward, 0.15))
+
+        return self.mode, float(forward), float(turn)
 
     def advance_waypoint(self):
         """Called only after the current waypoint has been reached"""
+        self.mode = "ALIGN"  # Align with the new segment before driving.
         self.current_waypoint_idx += 1
         self.move_2D()  # Stop briefly before checking the next waypoint.
 
@@ -636,8 +636,7 @@ class WaypointNode(Node):
             self.plan_current_goal()
 
         # Complete WayPoints
-        # Wait until we have a robot pose and a planned path.
-        if self.pose is None or not self.waypoints:
+        if self.pose is None or not self.waypoints: # Wait until we have a robot pose and a planned path.
             self.move_2D()
             return
 
@@ -647,50 +646,51 @@ class WaypointNode(Node):
             return
 
         # Get the grid cell we are currently trying to reach.
-        target_cell = self.waypoints[self.current_waypoint_idx]
+        endpoint_cell = self.waypoints[self.current_waypoint_idx]
 
         # Check whether BOTH x and y are within 5 cm of its centre.
-        if has_reached_grid(self.pose,target_cell,self.origin,self.resolution,tolerance=0.05,):
+        if has_reached_grid(self.pose,endpoint_cell,self.origin,self.resolution,tolerance=0.05,):
             self.advance_waypoint()
             return # end function call to either plan new path or stop if all goals have been reached
 
 
-        # Change Heading when required
-        
-        # Convert the target cell into world coordinates.
-        target_x, target_y = grid_to_world(
-            *target_cell, self.origin, self.resolution
-        )
-        # Find the direction from the robot to the target.
-        desired_heading = np.arctan2(
-            target_y - self.pose[1],
-            target_x - self.pose[0],
-        )
-        # Find the shortest angle to turn, in radians.
-        heading_error = wrap_angle(
-            desired_heading - np.deg2rad(self.pose[2])
-        )
-        # Function decides whether to turn or drive straight
-        mode, forward, turn = self.calculate_motion(heading_error)
+        tracking = self.get_lookahead_info()
 
-        
+        # Endpoint recovery is deferred: stop and report this test failure.
+        if tracking["distance_to_lookahead"] <= 1e-6:
+            self.move_2D()
+            self.get_logger().warn(
+                "STOP: no forward distance remains, but endpoint is not reached.",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        mode, forward, turn = self.calculate_motion(
+            tracking["heading_error"],
+            tracking["distance_to_lookahead"],
+        )
+
+        # Stage 1 prints tracking information without moving the robot.
+        if self.tracking_test_only:
+            mode = "TEST"
+            forward = 0.0
+            turn = 0.0
+
+        lookahead_status = "YES" if tracking["lookahead"] else "NO"
+
         self.get_logger().info(
-            f"{mode} | "
-            f"goal={self.goal_idx + 1}/{len(self.goal_list)} | "
-            f"waypoint={self.current_waypoint_idx + 1}/{len(self.waypoints)} | "
-            f"target={target_cell} | "
-            f"dx={target_x - self.pose[0]:.3f} m | "
-            f"dy={target_y - self.pose[1]:.3f} m | "
-            f"yaw={self.pose[2]:.1f} deg | "
-            f"desired={np.rad2deg(desired_heading):.1f} deg | "
-            f"error={np.rad2deg(heading_error):.1f} deg | "
-            f"forward={forward:.2f} m/s | "
-            f"turn={turn:.2f} rad/s\n",
+            f"{mode} | GOAL {self.goal_idx + 1}/{len(self.goal_list)} | "
+            f"CELL {tracking['cell_number']}/{tracking['cell_count']} | "
+            f"LOOKAHEAD {lookahead_status} | "
+            f"DISTANCE TO LOOKAHEAD {tracking["distance_to_lookahead"]:+.3f} | "
+            f"LATERAL {tracking['lateral_error']:+.3f} m | "
+            f"HEADING {self.pose[2]:.1f} deg | "
+            f"CORRECT {np.rad2deg(tracking['heading_error']):+.1f} deg | "
+            f"FORWARD {forward:.2f} m/s | TURN {turn:.2f} rad/s\n",
             throttle_duration_sec=1.0,
         )
 
         self.move_2D(x=forward, y=0.0, turn=turn)
-
         
 
         ###### INSERT CODE HERE ######
