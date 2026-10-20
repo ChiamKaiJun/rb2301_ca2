@@ -6,7 +6,7 @@ import os
 import time
 
 import numpy as np
-import heapq
+from rb2301_ca2.pid_controller import PIDController
 import rclpy
 from rclpy.node import Node
 from rclpy.logging import set_logger_level, LoggingSeverity
@@ -61,7 +61,6 @@ sim_config = {
     "goal_list": [(3.5, -3.5), (3.3, 0.3), (2.5, -3.5), (-0.3, -3.7)],
     "max_translate_velocity": 1.4,
 }
-
 IRL_RUNS = ("test1", "test2", "full")
 
 
@@ -193,7 +192,7 @@ def astar(grid, start, goal):
             # outgoing direction (current → neighbour). Skip the starting cell.
             if current in parent and (di, dj) != (current[0] - parent[current][0], current[1] - parent[current][1]):
                 # Penalise direction changes to favour paths with fewer turns.
-                new_g += 0.1
+                new_g += 0.0
 
             # Update if this route is cheaper.
             # Undiscovered cells have a default cost of infinity.
@@ -230,7 +229,23 @@ def get_heading_error(robot_pose, target):
     # Negative error: turn clockwise.
     return wrap_angle(desired_heading - current_heading)
 
-# PID CLASS
+# All controller tuning lives here. Angles are radians, distances metres.
+# These are starting values; verify on the robot before increasing speed.
+CONTROL_SETTINGS = {
+    "heading_kp": 3.5, "heading_ki": 0.0, "heading_kd": 0.0,
+    "align_tolerance": math.radians(5.0),
+    "heading_deadband": math.radians(1.0),
+    "realign_angle": math.radians(30.0),
+    "waypoint_tolerance": 0.05,
+    "carrot_spacing": 0.4, "carrot_advance_fraction": 0.90,
+    "distance_kp": 1.5,
+    "lateral_on": 0.03, "lateral_off": 0.02,
+}
+SIM_CONTROL = {"forward_speed": 1.0, "turn_speed": 2.8,
+               "min_turn_speed": 1.5, "min_forward_speed": 0.15}
+REAL_CONTROL = {"forward_speed": 0.4, "turn_speed": 0.4,
+                "min_turn_speed": 0.0, "min_forward_speed": 0.0}
+
 
 # Checker if it reached grid
 def has_reached_grid(robot_pose, target_cell, origin,
@@ -301,27 +316,18 @@ class WaypointNode(Node):
         self.goal_idx = 0
         self.waypoints = []
         
-        # Controller Settings
-        self.lookahead_cells = 2
-        self.waypoint_path_indices = []
-        self.progress_idx = 0
-
-        # Start with logging only. Set False after checking target selection.
-        self.tracking_test_only = False
-
-        # Remember whether lateral correction is active.
-        self.correcting_lateral = False  
-
-        # Controller settings — conservative starting values.
+        self.settings = {**CONTROL_SETTINGS,
+                         **(SIM_CONTROL if is_simulation else REAL_CONTROL)}
+        self.heading_pid = PIDController(
+            self.settings["heading_kp"], self.settings["heading_ki"],
+            self.settings["heading_kd"], self.settings["turn_speed"], angular=True)
         self.mode = "ALIGN"
-        self.forward_speed = 0.50           # Maximum forward speed, m/s.
-        self.turn_speed = 2.8 if self.is_simulation else 0.4
-        self.min_turn_speed = 1.5 if self.is_simulation else 0.0
-        self.heading_tolerance = np.deg2rad(0.3)
-        self.heading_kp = 3.5
-        self.distance_kp = 1.5
-        self.realign_angle = np.deg2rad(30.0)
-
+        self.current_waypoint_idx = 0
+        self.carrot_from = 0.0
+        self.carrot_to = self.settings["carrot_spacing"]
+        self.correcting_lateral = False
+        self.tracking_test_only = False
+        self._last_control_time = None
 
         # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
         if self.is_simulation:
@@ -388,8 +394,11 @@ class WaypointNode(Node):
         current_cell = clip(world_to_grid(self.pose[0], self.pose[1], self.origin, self.resolution))
         goal_cells = [clip(world_to_grid(gx, gy, self.origin, self.resolution)) for gx, gy in self.goal_list]
         grid = Grid(self.map_array, starting_position=current_cell, goal_position=goal_cells[-1])
-        #grid.print_grid_map(waypoints=goal_cells, path=self.path)
-        grid.draw_grid_map(waypoints=self.waypoints, path=self.path)
+        if self.is_simulation:
+            grid.draw_grid_map(waypoints=self.waypoints, path=self.path)
+        else:
+            # Works over SSH without a desktop image viewer.
+            grid.print_grid_map(waypoints=goal_cells, path=self.path)
 
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
@@ -421,279 +430,189 @@ class WaypointNode(Node):
         twist_msg = Twist()
         x = np.clip(x, -max_translate_velocity, max_translate_velocity)
         y = np.clip(y, -max_translate_velocity, max_translate_velocity)
-        turn = np.clip(turn, -max_translate_velocity*2, max_translate_velocity*2)
+        turn = np.clip(turn, -self.settings["turn_speed"], self.settings["turn_speed"])
         twist_msg.linear.x, twist_msg.linear.y, twist_msg.linear.z = float(x), float(y), 0.0
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
         self.publisher_.publish(twist_msg)
 
-    def set_waypoints(self, waypoints:list):
-        '''Set new waypoints when a goal has been reached'''
-        self.goal_reached = False
-        self.waypoints = waypoints
+    def reset_tracking(self):
+        """Start a new segment with fresh controller and carrot state."""
+        self.mode = "ALIGN"
+        self.heading_pid.reset()
+        self.correcting_lateral = False
+        self.carrot_from = 0.0
+        self.carrot_to = self.settings["carrot_spacing"]
+        self._last_control_time = None
 
-    ############# Our own functions ################
     def plan_current_goal(self):
-        """Plan the route to the current goal and prepare its waypoints."""
-        self.plan_new_path = False # Do not plan new plan until goal has been reached
+        """Plan once per goal; a failed plan must never reuse an old path."""
         self.move_2D()
-
-        # Convert the current robot position into a grid cell.
-        start = world_to_grid(self.pose[0], self.pose[1],self.origin, self.resolution)
-
-        # Choose current goal, convert into grid coordinates
-        goal_x, goal_y = self.goal_list[self.goal_idx]
-        goal = world_to_grid(goal_x, goal_y,self.origin, self.resolution)
-
-        # PLAN A* ROUTE
+        self.plan_new_path = False
+        self.path, self.waypoints = [], []
+        self.current_waypoint_idx = 0
+        start = world_to_grid(*self.pose[:2], self.origin, self.resolution)
+        goal = world_to_grid(*self.goal_list[self.goal_idx], self.origin, self.resolution)
         route = astar(self.map_array, start, goal)
         if route is None:
-            self.get_logger().error(
-                f"No route found: {start} -> {goal}"
-            )
-        else:
-            # Route found!
-            self.path = route
-            self.waypoints = get_turn_waypoints(route) # Navigate using only the start, corners, and endpoint.
-            self.waypoint_path_indices = [self.path.index(cell) for cell in self.waypoints] # Link each corner/endpoint to its position in the full path.
-            self.progress_idx = 0
-            self.mode = "ALIGN"
-            self.get_logger().info(
-                f"Route to Goal {goal_x,goal_y} found! {len(route) - 1} steps, "
-                f"{len(self.waypoints)} simplified waypoints"
-            )
-            #  Initialise waypointskip the starting cell unless it is the only cell in the route.
-            self.current_waypoint_idx = 1 if len(self.waypoints) > 1 else 0 
+            self.get_logger().error(f"No route: start={start}, goal={goal}. Stopped.")
+            return
+        self.path = route
+        self.waypoints = get_turn_waypoints(route)
+        self.current_waypoint_idx = 1 if len(self.waypoints) > 1 else 0
+        self.reset_tracking()
+        self.get_logger().info(
+            f"Goal {self.goal_idx + 1}: {len(route)-1} grid steps, "
+            f"{len(self.waypoints)} waypoints")
+
+    def waypoint_reached(self):
+        """Corners and goals still require BOTH coordinates within tolerance."""
+        return has_reached_grid(
+            self.pose, self.waypoints[self.current_waypoint_idx], self.origin,
+            self.resolution, tolerance=self.settings["waypoint_tolerance"])
 
     def get_lookahead_info(self):
-        """Use the full path for lookahead and simplified waypoints for corners."""
-        waypoint_idx = self.current_waypoint_idx
+        """Advance the carrot at 90% along each carrot interval, never past a corner.
 
-        lateral_error = 0.0  # Signed distance from the current segment; metres.
-
-        end_idx = self.waypoint_path_indices[waypoint_idx]
-        start_idx = self.waypoint_path_indices[max(0, waypoint_idx - 1)]
-
-        start = np.array(grid_to_world(
-            *self.path[start_idx], self.origin, self.resolution
-        ))
-        end = np.array(grid_to_world(
-            *self.path[end_idx], self.origin, self.resolution
-        ))
-
+        Progress is projected onto the segment: sideways motion does not count.
+        The final carrot stays at the endpoint until waypoint_reached() succeeds.
+        """
+        idx = self.current_waypoint_idx
+        start = np.array(grid_to_world(*self.waypoints[max(0, idx-1)],
+                                       self.origin, self.resolution))
+        end = np.array(grid_to_world(*self.waypoints[idx], self.origin, self.resolution))
         robot = self.pose[:2]
         segment = end - start
-        length = np.linalg.norm(segment)
-
+        length = float(np.linalg.norm(segment))
+        lateral = 0.0
+        target = end
         if length > 1e-9:
             direction = segment / length
-
             offset = robot - start
-            lateral_error = direction[0] * offset[1] - direction[1] * offset[0]
+            progress = float(np.clip(np.dot(offset, direction), 0.0, length))
+            lateral = float(direction[0]*offset[1] - direction[1]*offset[0])
+            self.carrot_to = min(self.carrot_to, length)
+            while self.carrot_to < length:
+                threshold = self.carrot_from + self.settings["carrot_advance_fraction"] * (
+                    self.carrot_to - self.carrot_from)
+                if progress < threshold:
+                    break
+                self.carrot_from = self.carrot_to
+                self.carrot_to = min(length, self.carrot_to + self.settings["carrot_spacing"])
+            target = start + self.carrot_to * direction
 
-            # Progress depends on movement along the line, not sideways movement.
-            distance_along = float(np.clip(
-                np.dot(robot - start, direction),
-                0.0,
-                length,
-            ))
-
-            closest_point = start + distance_along * direction
-
-            # Count cell centres passed along this straight segment.
-            steps = int(np.floor(
-                distance_along / self.resolution + 1e-9
-            ))
-
-            # Keep progress in order and within the current segment.
-            self.progress_idx = min(
-                end_idx,
-                max(start_idx, self.progress_idx, start_idx + steps),
-            )
-        else:
-            # One-cell route: approach that cell's centre directly.
-            closest_point = robot.copy()
-            self.progress_idx = end_idx
-
-        # Look two cells ahead, but never beyond the next corner.
-        lookahead_idx = min(
-            self.progress_idx + self.lookahead_cells,
-            end_idx,
-        )
-
-        target = np.array(grid_to_world(
-            *self.path[lookahead_idx], self.origin, self.resolution
-        ))
-
-        # Heading correction points from the robot toward the target.
+        # This hysteresis selects carrot aiming versus parallel-to-segment aiming.
+        # It is independent of the ALIGN/DRIVE hysteresis in calculate_motion().
+        if abs(lateral) >= self.settings["lateral_on"]:
+            self.correcting_lateral = True
+        elif abs(lateral) <= self.settings["lateral_off"]:
+            self.correcting_lateral = False
+        use_carrot = self.correcting_lateral or self.carrot_to >= length
         delta = target - robot
-        heading_error = 0.0
-
+        error = 0.0
         if np.linalg.norm(delta) > 1e-9:
-            if abs(lateral_error) >= 0.03:
-                self.correcting_lateral = True
-            elif abs(lateral_error) <= 0.02:
-                self.correcting_lateral = False
+            desired = math.atan2(delta[1], delta[0]) if use_carrot else math.atan2(segment[1], segment[0])
+            error = wrap_angle(desired - math.radians(self.pose[2]))
+        return {"heading_error": error, "lateral_error": lateral,
+                "distance_to_endpoint": float(np.linalg.norm(end-robot)),
+                "target": target, "use_carrot": use_carrot}
 
-            # Aim at the lookahead when correcting or approaching the endpoint.
-            use_lookahead = self.correcting_lateral or lookahead_idx == end_idx
-            # If not correcting or reaching endpoint, follow direction of segment
-            desired_heading = np.arctan2(delta[1], delta[0]) if use_lookahead else np.arctan2(segment[1], segment[0])
-
-            # Shortest turn from current heading: positive anticlockwise, negative clockwise.
-            heading_error = wrap_angle(
-                desired_heading - np.deg2rad(self.pose[2])
-            )
-
-        return {
-            "heading_error": float(heading_error),
-            "distance_to_lookahead": float(
-                np.linalg.norm(target - robot)
-            ),
-            "cell_number": self.progress_idx - start_idx + 1,
-            "cell_count": end_idx - start_idx + 1,
-            "lookahead": use_lookahead,
-            "lateral_error": float(lateral_error)
-        }
-
-    def calculate_motion(self, heading_error, distance_to_lookahead):
-        """Forward P control uses the distance from the robot to the lookahead target."""
-
-        # ALIGN finishes at a small error.
-        # DRIVE only returns to ALIGN if the error becomes large.
-        if self.mode == "ALIGN":
-            if abs(heading_error) <= self.heading_tolerance:
-                self.mode = "DRIVE"
-        elif abs(heading_error) >= self.realign_angle:
+    def calculate_motion(self, tracking, dt):
+        """State decisions and speed policy; PID only calculates angular output."""
+        cfg = self.settings
+        error = tracking["heading_error"]
+        old_mode = self.mode
+        if self.mode == "ALIGN" and abs(error) <= cfg["align_tolerance"]:
+            self.mode = "DRIVE"
+        elif self.mode == "DRIVE" and abs(error) >= cfg["realign_angle"]:
             self.mode = "ALIGN"
+        if self.mode != old_mode:
+            self.heading_pid.reset()
+            self.get_logger().info(
+                f"{old_mode} -> {self.mode}: heading error {math.degrees(error):+.1f} deg")
 
-        # Heading P controller.
-        turn = self.heading_kp * heading_error
-
-        if abs(heading_error) <= self.heading_tolerance:
+        if abs(error) <= cfg["heading_deadband"]:
+            self.heading_pid.reset()
             turn = 0.0
         else:
-            # Simulation workaround: preserve direction when boosting small turns.
-            turn = np.copysign(max(abs(turn), self.min_turn_speed), turn)  # Boost small turns while preserving direction.
-            turn = float(np.clip(turn, -self.turn_speed, self.turn_speed))  # Keep the maximum speed limit.
+            turn = self.heading_pid.compute(error, dt)
         forward = 0.0
-
         if self.mode == "DRIVE":
-            # Forward P controller: closest point to lookahead target.
-            forward = min(
-                self.forward_speed,
-                self.distance_kp * distance_to_lookahead,
-            )
+            approach = min(cfg["forward_speed"],
+                           cfg["distance_kp"] * tracking["distance_to_endpoint"])
 
-            # Reduce forward movement while correcting heading.
-            forward *= max(0.0, np.cos(heading_error))
+            heading_scale = max(0.0, 1.0 - abs(error)/cfg["realign_angle"])
+            forward = approach * heading_scale
+        return forward, turn
 
-            # Temporary simulation test: determine whether low forward commands cause the stall.
-            if self.is_simulation:
-                forward = min(self.forward_speed, max(forward, 0.15))
+    def apply_motion_limits(self, forward, turn):
+        """Keep the professor's simulation workaround outside the PID math.
 
-        return self.mode, float(forward), float(turn)
+        Zero commands always remain zero. Real-robot minimums default to zero.
+        Minimum speeds can defeat fine positioning; tune them per environment.
+        """
+        cfg = self.settings
+        if turn != 0.0:
+            turn = math.copysign(max(abs(turn), cfg["min_turn_speed"]), turn)
+        if forward > 0.0:
+            forward = max(forward, cfg["min_forward_speed"])
+        return (float(np.clip(forward, 0.0, cfg["forward_speed"])),
+                float(np.clip(turn, -cfg["turn_speed"], cfg["turn_speed"])))
 
     def advance_waypoint(self):
-        """Called only after the current waypoint has been reached"""
-        self.mode = "ALIGN"  # Align with the new segment before driving.
+        self.move_2D()
         self.current_waypoint_idx += 1
-        self.move_2D()  # Stop briefly before checking the next waypoint.
-
-        # Last waypoint reached
         if self.current_waypoint_idx >= len(self.waypoints):
-            if self.goal_idx == len(self.goal_list) - 1:
-            # Last goal reached: keep the goal index unchanged.
-                self.plan_new_path = False
+            self.goal_idx += 1
+            self.plan_new_path = self.goal_idx < len(self.goal_list)
+            if not self.plan_new_path:
                 self.get_logger().info("All goals reached!")
-            else:
-                # Another goal remains. Plan its route next callback.
-                self.goal_idx += 1
-                self.plan_new_path = True
-
+        self.reset_tracking()
 
     def timer_callback(self):
-        """Controller loop. Insert path planning and PID control logic here"""
+        """Mission checks -> tracking geometry -> motion controller -> publish."""
         if self.pose is None:
-            return # Does not run if no pose received from Odom or Optitrack
-        now = time.time()
-        if now - getattr(self, "_last_pose_log", 0.0) >= 1.0: # at most once a second, so it does not bury the map / warnings below
-            self._last_pose_log = now
-            self.get_logger().debug(f"Pose: {self.pose}")
-
-        if self.calibrate:
-            self._print_calibration()
-            return # Calibration mode: look, don't drive
-
+            self.get_logger().info("Waiting for pose...", throttle_duration_sec=2.0)
+            return
         self._check_start_once()
-
-        if self.path != self._last_printed_path: # Prints once immediately (map + start + goals), then again each time self.path changes
+        if self.path != self._last_printed_path:
             self.print_map()
             self._last_printed_path = list(self.path)
-
-        ###### INSERT CODE HERE ######
-        # Plan with A* and Generate Waypoints for each goal
+        if self.calibrate:
+            self._print_calibration()
+            return
+        if self.goal_idx >= len(self.goal_list):
+            self.move_2D()
+            return
         if self.plan_new_path:
             self.plan_current_goal()
-
-        # Complete WayPoints
-        if self.pose is None or not self.waypoints: # Wait until we have a robot pose and a planned path.
+            return
+        if not self.waypoints:
             self.move_2D()
             return
-
-        # Stop when all waypoints have been reached.
-        if self.current_waypoint_idx >= len(self.waypoints):
-            self.move_2D()
-            return
-
-        # Get the grid cell we are currently trying to reach.
-        endpoint_cell = self.waypoints[self.current_waypoint_idx]
-
-        # Check whether BOTH x and y are within 5 cm of its centre.
-        if has_reached_grid(self.pose,endpoint_cell,self.origin,self.resolution,tolerance=0.05,):
+        if self.waypoint_reached():
             self.advance_waypoint()
-            return # end function call to either plan new path or stop if all goals have been reached
-
-
-        tracking = self.get_lookahead_info()
-
-        # Endpoint recovery is deferred: stop and report this test failure.
-        if tracking["distance_to_lookahead"] <= 1e-6:
-            self.move_2D()
-            self.get_logger().warn(
-                "STOP: no forward distance remains, but endpoint is not reached.",
-                throttle_duration_sec=1.0,
-            )
             return
 
-        mode, forward, turn = self.calculate_motion(
-            tracking["heading_error"],
-            tracking["distance_to_lookahead"],
-        )
-
-        # Stage 1 prints tracking information without moving the robot.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        dt = 0.0 if self._last_control_time is None else now - self._last_control_time
+        self._last_control_time = now
+        tracking = self.get_lookahead_info()
+        forward, raw_turn = self.calculate_motion(tracking, dt)
+        #forward, turn = self.apply_motion_limits(forward, raw_turn)
+        turn=raw_turn 
         if self.tracking_test_only:
-            mode = "TEST"
-            forward = 0.0
-            turn = 0.0
-
-        lookahead_status = "YES" if tracking["lookahead"] else "NO"
-
+            self.get_logger().warn("TEST MODE")
+            forward, turn = 0.0, 0.0
         self.get_logger().info(
-            f"{mode} | GOAL {self.goal_idx + 1}/{len(self.goal_list)} | "
-            f"CELL {tracking['cell_number']}/{tracking['cell_count']} | "
-            f"LOOKAHEAD {lookahead_status} | "
-            f"DISTANCE TO LOOKAHEAD {tracking["distance_to_lookahead"]:+.3f} | "
-            f"LATERAL {tracking['lateral_error']:+.3f} m | "
-            f"HEADING {self.pose[2]:.1f} deg | "
-            f"CORRECT {np.rad2deg(tracking['heading_error']):+.1f} deg | "
-            f"FORWARD {forward:.2f} m/s | TURN {turn:.2f} rad/s\n",
-            throttle_duration_sec=1.0,
-        )
-
+            f"{self.mode} | goal {self.goal_idx+1}/{len(self.goal_list)} | "
+            f"waypoint {self.current_waypoint_idx+1}/{len(self.waypoints)} | "
+            f"carrot={self.carrot_to:.2f} m aim={tracking['use_carrot']} | "
+            f"heading={math.degrees(tracking['heading_error']):+.1f} deg | "
+            f"lateral={tracking['lateral_error']:+.3f} m | "
+            f"endpoint={tracking['distance_to_endpoint']:.3f} m | "
+            f"v={forward:.2f} raw_w={raw_turn:+.2f} w={turn:+.2f} ",
+            throttle_duration_sec=1.0)
         self.move_2D(x=forward, y=0.0, turn=turn)
-        
-
-        ###### INSERT CODE HERE ######
 
 
 class Grid():
@@ -900,6 +819,7 @@ def main(args=None):
     max_translate_velocity = config["max_translate_velocity"]
 
     map_array = np.load(os.path.join(_PACKAGE_DIR, config["map_file"]), allow_pickle=True)
+    print(f"Map loaded: {config['map_file']}, shape={map_array.shape}, values={np.unique(map_array)}")
     waypoint = WaypointNode(map_array, config["goal_list"], is_simulation, config["origin"], config["resolution"],
                             frame=frame, robot_number=robot_number, expected_start=expected_start, calibrate=cli_args.calibrate)
 
