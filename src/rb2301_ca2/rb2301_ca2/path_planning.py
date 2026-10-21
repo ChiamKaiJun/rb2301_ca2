@@ -396,8 +396,11 @@ class WaypointNode(Node):
         grid = Grid(self.map_array, starting_position=current_cell, goal_position=goal_cells[-1])
         if self.is_simulation:
             grid.draw_grid_map(waypoints=self.waypoints, path=self.path)
+            grid.print_grid_map(waypoints=goal_cells, path=self.path)
+            
         else:
             # Works over SSH without a desktop image viewer.
+            grid.draw_grid_map(waypoints=self.waypoints, path=self.path, save_path="tmp/robot_map.png")
             grid.print_grid_map(waypoints=goal_cells, path=self.path)
 
     def yaw_from_quaternion(self, q):
@@ -544,7 +547,7 @@ class WaypointNode(Node):
             forward = approach * heading_scale
         return forward, turn
 
-    def apply_motion_limits(self, forward, turn):
+    def apply_motion_limits(self, forward, turn): # Not needed anymore 
         """Keep the professor's simulation workaround outside the PID math.
 
         Zero commands always remain zero. Real-robot minimums default to zero.

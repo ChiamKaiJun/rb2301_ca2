@@ -161,7 +161,7 @@ You edit on your laptop and copy the package to the robot. The robot runs Ubuntu
 **1. Make a workspace on the robot** (ssh in as usual). Use your group number so groups don't overwrite each other:
 
 ```bash
-mkdir -p ~/Downloads/rb2301_ca2_<group>/src
+mkdir -p ~/Downloads/rb2301_ca2_11/src
 ```
 
 **2. Copy your package.** Run this on your laptop, in a normal terminal, not in the ssh one. Repeat it every time you change `path_planning.py`:
@@ -261,3 +261,43 @@ tools/irl_calibrate.py         for TAs, see below
 Calibration is done once per maze placement, and again if the maze or Optitrack gets moved. Put a robot on two or more known maze points far apart and read the raw pose with `--calibrate`. Then run `python3 tools/irl_calibrate.py --pair 0.5 0.5 <opti_x> <opti_y> --pair 2.7 2.7 <opti_x> <opti_y>`. The residual should be 1 to 2 cm and it warns above 5 cm. Paste `origin_x`, `origin_y` and `rotation_deg` into `[frame]` in `optitrack_variables.config`. Motive has to stream Z-up.
 
 Rigid bodies are created facing maze +y, which is what `heading_offset_deg = auto` assumes. A robot whose rigid body was made differently gets its own line under `[heading_offsets]` as `<robot number> = <reported heading minus true maze heading>` (robots 7 and 12 are measured). The real-robot speed limit is `max_translate_velocity` in `load_irl_config()` in `path_planning.py`.
+
+
+## Our Shortcuts
+
+ssh bingda@192.168.1.205
+
+mkdir -p ~/Downloads/rb2301_ca2_11/src
+
+rsync -auvx --delete ~/rb2301_ca2/src/rb2301_ca2 bingda@192.168.1.2NN:~/Downloads/rb2301_ca2_11/src
+
+
+cd ~/Downloads/rb2301_ca2_11
+colb
+
+3 terminals 
+
+basecontrol          # terminal 1, drives the wheels
+
+vrpn                 # terminal 2, Optitrack poses
+
+cd ~/Downloads/rb2301_ca2_<group> && source install/setup.bash && ros2 run rb2301_ca2 path_planning --run test1     # terminal 3
+
+
+ros2 topic list # check for vrpn
+
+
+### ALIAS
+~/.bashrc
+
+alias ca2='cd ~/Downloads/rb2301_ca2_11 && source install/setup.bash && ros2 run rb2301_ca2 path_planning --run test1'
+
+alias ca2sync='rsync -auvx --delete ~/rb2301/src/rb2301_ca2 bingda@192.168.1.2NN:~/Downloads/rb2301_ca2_11/src'
+
+Ctrl + O # Save 
+
+Ctrl + X # Exit
+
+source ~/.bashrc
+
+
