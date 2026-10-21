@@ -192,7 +192,7 @@ def astar(grid, start, goal):
             # outgoing direction (current → neighbour). Skip the starting cell.
             if current in parent and (di, dj) != (current[0] - parent[current][0], current[1] - parent[current][1]):
                 # Penalise direction changes to favour paths with fewer turns.
-                new_g += 0.0
+                new_g += 0.1
 
             # Update if this route is cheaper.
             # Undiscovered cells have a default cost of infinity.
@@ -306,7 +306,7 @@ def get_turn_waypoints(path):
 class WaypointNode(Node):
     '''Node to calculate path and move robot towards given goal_coordinates, using pose info from either gazebo odometer or optitrack'''
     def __init__(self, map_array:np.array, goal_list:list, is_simulation:bool=True, origin:tuple=(0.0, 0.0), resolution:float=occupancy_grid_resolution,
-                 frame:dict=None, robot_number:int=3, expected_start:tuple=None, calibrate:bool=False):
+                 frame:dict=None, robot_number:int=3, expected_start:tuple=None, calibrate:bool=False, debug_tracking:bool=False):
         super().__init__('waypoint')
         self.get_logger().info("Starting WaypointNode")
 
@@ -360,6 +360,15 @@ class WaypointNode(Node):
         self.pose = None
         self.path = [] # Set this to your planned route (a list of grid-index tuples, in travel order) once you've computed it -- it'll automatically show up in the terminal map print
         self._last_printed_path = None
+        self._tracking_debug = None
+        self._debug_tracking = None
+        self._debug_command = (0.0, 0.0)
+        if debug_tracking:
+            try:
+                from rb2301_ca2.tracking_debug import TrackingDebug
+                self._tracking_debug = TrackingDebug(self)
+            except Exception as exc:
+                self.get_logger().error(f"Tracking debug disabled: {exc}")
 
     def _print_calibration(self):
         '''--calibrate: twice a second, print the raw Optitrack pose next to the maze-frame pose and grid cell.'''
@@ -400,7 +409,7 @@ class WaypointNode(Node):
             
         else:
             # Works over SSH without a desktop image viewer.
-            grid.draw_grid_map(waypoints=self.waypoints, path=self.path, save_path="tmp/robot_map.png")
+            grid.draw_grid_map(waypoints=self.waypoints, path=self.path, save_path="/tmp/robot_map.png", show=False)
             grid.print_grid_map(waypoints=goal_cells, path=self.path)
 
     def yaw_from_quaternion(self, q):
@@ -437,6 +446,7 @@ class WaypointNode(Node):
         twist_msg.linear.x, twist_msg.linear.y, twist_msg.linear.z = float(x), float(y), 0.0
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
         self.publisher_.publish(twist_msg)
+        self._debug_command = (float(x), float(turn))
 
     def reset_tracking(self):
         """Start a new segment with fresh controller and carrot state."""
@@ -509,7 +519,10 @@ class WaypointNode(Node):
             self.correcting_lateral = True
         elif abs(lateral) <= self.settings["lateral_off"]:
             self.correcting_lateral = False
-        use_carrot = self.correcting_lateral or self.carrot_to >= length
+        at_endpoint = self.carrot_to >= length
+        use_carrot = self.correcting_lateral or at_endpoint
+        heading_source = "ENDPOINT" if at_endpoint else (
+            "CARROT" if self.correcting_lateral else "SEGMENT")
         delta = target - robot
         error = 0.0
         if np.linalg.norm(delta) > 1e-9:
@@ -517,7 +530,8 @@ class WaypointNode(Node):
             error = wrap_angle(desired - math.radians(self.pose[2]))
         return {"heading_error": error, "lateral_error": lateral,
                 "distance_to_endpoint": float(np.linalg.norm(end-robot)),
-                "target": target, "use_carrot": use_carrot}
+                "target": target, "use_carrot": use_carrot,
+                "heading_source": heading_source}
 
     def calculate_motion(self, tracking, dt):
         """State decisions and speed policy; PID only calculates angular output."""
@@ -572,13 +586,26 @@ class WaypointNode(Node):
         self.reset_tracking()
 
     def timer_callback(self):
+        """Keep optional debug failures outside the motion-control logic."""
+        self._debug_tracking = None
+        self._control_step()
+        if self._tracking_debug is not None:
+            try:
+                self._tracking_debug.publish(self._debug_tracking, self._debug_command)
+            except Exception as exc:
+                self.get_logger().error(f"Tracking debug disabled: {exc}")
+                self._tracking_debug = None
+
+    def _control_step(self):
         """Mission checks -> tracking geometry -> motion controller -> publish."""
         if self.pose is None:
             self.get_logger().info("Waiting for pose...", throttle_duration_sec=2.0)
             return
         self._check_start_once()
         if self.path != self._last_printed_path:
-            self.print_map()
+            # The separate viewer displays the map when debug streaming is on.
+            if self._tracking_debug is None:
+                self.print_map()
             self._last_printed_path = list(self.path)
         if self.calibrate:
             self._print_calibration()
@@ -600,6 +627,7 @@ class WaypointNode(Node):
         dt = 0.0 if self._last_control_time is None else now - self._last_control_time
         self._last_control_time = now
         tracking = self.get_lookahead_info()
+        self._debug_tracking = tracking
         forward, raw_turn = self.calculate_motion(tracking, dt)
         #forward, turn = self.apply_motion_limits(forward, raw_turn)
         turn=raw_turn 
@@ -790,6 +818,8 @@ def main(args=None):
         '--calibrate', action='store_true',
         help="Real robot: only print Optitrack and maze-frame poses (twice a second) and never publish cmd_vel. Use it to set origin/rotation."
     )
+    arg_parser.add_argument('--debug-tracking', action='store_true',
+                            help="Publish tracking data for the separate laptop viewer.")
     cli_args, ros_args = arg_parser.parse_known_args(args=args)
     run = cli_args.run or ("test1" if cli_args.calibrate else None)
     is_simulation = run is None # Remember: pass --run test1|test2|full to ca2.sh when testing on the real lab setup
@@ -824,7 +854,8 @@ def main(args=None):
     map_array = np.load(os.path.join(_PACKAGE_DIR, config["map_file"]), allow_pickle=True)
     print(f"Map loaded: {config['map_file']}, shape={map_array.shape}, values={np.unique(map_array)}")
     waypoint = WaypointNode(map_array, config["goal_list"], is_simulation, config["origin"], config["resolution"],
-                            frame=frame, robot_number=robot_number, expected_start=expected_start, calibrate=cli_args.calibrate)
+                            frame=frame, robot_number=robot_number, expected_start=expected_start, calibrate=cli_args.calibrate,
+                            debug_tracking=cli_args.debug_tracking)
 
     # Start spinning the waypoint node and only stop once SystemExit error is raised within the node callback
     try:

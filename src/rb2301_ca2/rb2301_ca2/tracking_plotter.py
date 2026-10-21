@@ -1,11 +1,13 @@
 """Laptop-only live map and graphs. Run separately from path_planning.
 
-Receive every available control sample, redraw at 5 Hz, retain 20 seconds.
+Receive every available control sample, redraw at 5 Hz, retain 50 seconds.
 All Matplotlib work stays on the main thread of this separate process.
 """
 import argparse
 from collections import deque
 import csv
+from datetime import datetime
+from pathlib import Path
 import json
 import math
 import time
@@ -14,13 +16,17 @@ import numpy as np
 
 SOURCE = {'NONE': 0, 'SEGMENT': 1, 'CARROT': 2, 'ENDPOINT': 3}
 MODE = {'ALIGN': 1, 'DRIVE': 2}  # All other states are shown as idle.
+LABELS = ['Heading error (deg)', 'Lateral error (m)',
+          'Forward command (m/s)', 'Turn command (rad/s)',
+          'Heading reference', 'Motion mode']
+
 CSV_FIELDS = ['run_id', 'seq', 'stamp', 'heading', 'lateral', 'forward',
               'turn', 'source', 'mode', 'goal', 'segment']
 
 
 class TrackingPlot:
     """Display only: no PID, path planning, or movement commands."""
-    def __init__(self, window=20.0):
+    def __init__(self, window=50.0):
         import matplotlib.pyplot as plt
         from matplotlib.colors import ListedColormap
 
@@ -32,22 +38,19 @@ class TrackingPlot:
         self.scene = None
         self.scene_dirty = False
         self.fig = plt.figure(figsize=(14, 10))
-        layout = self.fig.add_gridspec(7, 2, width_ratios=[1, 1.4])
+        layout = self.fig.add_gridspec(6, 2, width_ratios=[1, 1.4])
         self.map_ax = self.fig.add_subplot(layout[:, 0])
         self.axes = []
-        labels = ['Heading error (deg)', 'Lateral error (m)',
-                  'Forward cmd (m/s)', 'Turn cmd (rad/s)',
-                  'Heading source', 'Mode', 'Goal / segment']
         self.lines = []
-        for i, label in enumerate(labels):
+        for i, label in enumerate(LABELS):
             ax = self.fig.add_subplot(layout[i, 1],
                                       sharex=self.axes[0] if self.axes else None)
             line, = ax.plot([], [], drawstyle='steps-post' if i >= 4 else 'default')
-            ax.set_ylabel(label, fontsize=9)
+            ax.set_title(label, loc='left', fontsize=10, pad=4)
             ax.grid(True, alpha=0.25)
             if i < 4:
                 ax.axhline(0, color='black', linewidth=0.6)
-            if i < 6:
+            if i < 5:
                 ax.tick_params(labelbottom=False)
             self.axes.append(ax)
             self.lines.append(line)
@@ -57,11 +60,7 @@ class TrackingPlot:
         self.axes[5].set_yticks([0, 1, 2])
         self.axes[5].set_yticklabels(['IDLE', 'ALIGN', 'DRIVE'])
         self.axes[5].set_ylim(-0.3, 2.3)
-        self.lines[6].set_label('Goal')
-        self.segment_line, = self.axes[6].plot([], [], drawstyle='steps-post',
-                                              label='Segment', color='tab:orange')
-        self.axes[6].legend(loc='upper left', fontsize=8, ncol=2)
-        self.axes[6].set_xlabel('Controller time since first received sample (s)')
+        self.axes[5].set_xlabel('Elapsed controller time (s)')
 
         # Array axes are [x, y]. set_scene() transposes to image [row=y, col=x].
         self.map_image = self.map_ax.imshow(np.zeros((1, 1)), origin='lower',
@@ -83,7 +82,7 @@ class TrackingPlot:
                            ncol=2, fontsize=8)
         self.title = self.fig.suptitle('Waiting for tracking data')
         self.fig.subplots_adjust(left=0.06, right=0.98, bottom=0.08,
-                                 top=0.91, wspace=0.42, hspace=0.25)
+                                 top=0.91, wspace=0.35, hspace=0.65)
 
     @staticmethod
     def set_points(line, points):
@@ -131,7 +130,7 @@ class TrackingPlot:
         rows = list(self.samples)
         latest = rows[-1]
         # Insert gaps so missing packets do not look like measured convergence.
-        times, values = [], [[] for _ in range(8)]
+        times, values = [], [[] for _ in range(6)]
         previous = None
         for row in rows:
             t = row['stamp'] - self.start_stamp
@@ -142,17 +141,16 @@ class TrackingPlot:
                     series.append(np.nan)
             times.append(t)
             data = [row['heading'], row['lateral'], row['forward'], row['turn'],
-                    SOURCE[row['source']], MODE.get(row['mode'], 0), row['goal'], row['segment']]
+                    SOURCE[row['source']], MODE.get(row['mode'], 0)]
             for series, value in zip(values, data):
                 series.append(np.nan if value is None else value)
             previous = row
         for line, series in zip(self.lines, values):
             line.set_data(times, series)
-        self.segment_line.set_data(times, values[7])
-        for i in [0, 1, 2, 3, 6]:
+        for i in [0, 1, 2, 3]:
             self.axes[i].relim()
             self.axes[i].autoscale_view(scalex=False)
-        end = max(1.0, times[-1])
+        end = max(self.window, times[-1])
         self.axes[0].set_xlim(max(0, end-self.window), end)
 
         same_scene = self.scene is not None and self.scene['run_id'] == self.run_id
@@ -173,10 +171,65 @@ class TrackingPlot:
                 arrow.xy = (x + 0.25*math.cos(angle), y + 0.25*math.sin(angle))
         age = time.monotonic() - self.last_received
         status = ' | NO NEW DATA {:.1f}s'.format(age) if age > 1 else ''
-        self.title.set_text('{} | goal {}/{} | segment {}/{} | aiming: {}{}'.format(
+        self.title.set_text('{} | goal {}/{} | segment {}/{} | heading reference: {}{}'.format(
             latest['mode'], latest['goal'], latest['goals'], latest['segment'],
             latest['segments'], latest['source'], status))
         self.fig.canvas.draw_idle()
+
+
+def save_history(csv_path, show=False):
+    """Render all recorded samples, including those outside the live window."""
+    import matplotlib.pyplot as plt
+
+    with open(csv_path, newline='') as file:
+        rows = list(csv.DictReader(file))
+    if not rows:
+        print('No samples received; no history PNG generated.')
+        return
+    times, values = [], [[] for _ in range(6)]
+    previous = None
+    start = float(rows[0]['stamp'])
+    offset = 0.0
+    for row in rows:
+        stamp = float(row['stamp'])
+        restarted = previous and (row['run_id'] != previous['run_id'] or
+                                   stamp < float(previous['stamp']))
+        if restarted:
+            offset = times[-1] + 0.05
+            start = stamp
+        t = offset + stamp - start
+        if previous and (restarted or int(row['seq']) != int(previous['seq']) + 1 or
+                         stamp - float(previous['stamp']) > 0.25):
+            times.append(t)
+            for series in values:
+                series.append(np.nan)
+        times.append(t)
+        data = [float(row[k]) if row[k] else np.nan
+                for k in ['heading', 'lateral', 'forward', 'turn']]
+        data += [SOURCE[row['source']], MODE.get(row['mode'], 0)]
+        for series, value in zip(values, data):
+            series.append(value)
+        previous = row
+    fig, axes = plt.subplots(6, 1, figsize=(13, 11), sharex=True)
+    for i, (ax, label, series) in enumerate(zip(axes, LABELS, values)):
+        ax.plot(times, series, drawstyle='steps-post' if i >= 4 else 'default')
+        ax.set_title(label, loc='left', fontsize=10)
+        ax.grid(True, alpha=0.25)
+        if i < 4:
+            ax.axhline(0, color='black', lw=0.6)
+    axes[4].set_yticks(list(SOURCE.values()))
+    axes[4].set_yticklabels(list(SOURCE))
+    axes[5].set_yticks([0, 1, 2])
+    axes[5].set_yticklabels(['IDLE', 'ALIGN', 'DRIVE'])
+    axes[-1].set_xlabel('Elapsed controller time (s; restarts separated by gaps)')
+    fig.suptitle('Full received tracking history — ' + Path(csv_path).name)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    output = Path(csv_path).with_suffix('.png')
+    fig.savefig(output, dpi=150)
+    print('Saved history: {}'.format(output.resolve()))
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
 def main(args=None):
@@ -188,16 +241,24 @@ def main(args=None):
     from rb2301_ca2.tracking_debug import sample_qos, scene_qos
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--window', type=float, default=20.0, help='Visible seconds')
+    parser.add_argument('--window', type=float, default=50.0, help='Visible seconds')
     parser.add_argument('--refresh', type=float, default=5.0, help='Screen refresh Hz')
-    parser.add_argument('--csv', help='Optional CSV file for all received samples')
+    parser.add_argument('--csv', help='CSV output path (default: timestamped file in tracking_logs/)')
+    parser.add_argument('--history', help='Open a saved CSV as a full-history graph')
     options, ros_args = parser.parse_known_args(args)
+    if options.history:
+        save_history(options.history, show=True)
+        return
     if options.window <= 0 or options.refresh <= 0:
         parser.error('--window and --refresh must be positive')
     rclpy.init(args=ros_args)
     node = Node('tracking_plotter')
     plot = TrackingPlot(options.window)
-    logfile = open(options.csv, 'w', newline='') if options.csv else None
+    csv_path = Path(options.csv) if options.csv else Path('tracking_logs') / (
+        datetime.now().strftime('tracking_%Y%m%d_%H%M%S_%f') + '.csv')
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    logfile = open(csv_path, 'w', newline='')
+    print('Recording samples: {}'.format(csv_path.resolve()))
     writer = csv.DictWriter(logfile, CSV_FIELDS, extrasaction='ignore') if logfile else None
     if writer:
         writer.writeheader()
@@ -234,7 +295,11 @@ def main(args=None):
     poll_timer = plot.fig.canvas.new_timer(interval=10)
     poll_timer.add_callback(poll_ros)
     redraw_timer = plot.fig.canvas.new_timer(interval=max(1, int(1000/options.refresh)))
-    redraw_timer.add_callback(plot.redraw)
+    def refresh():
+        plot.redraw()
+        logfile.flush()
+
+    redraw_timer.add_callback(refresh)
     poll_timer.start()
     redraw_timer.start()
     node.get_logger().info('Viewer ready. Start path_planning with --debug-tracking.')
@@ -250,6 +315,7 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        save_history(csv_path)
 
 
 if __name__ == '__main__':
