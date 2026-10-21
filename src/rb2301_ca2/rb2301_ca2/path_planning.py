@@ -236,20 +236,20 @@ CONTROL_SETTINGS = {
     "align_tolerance": math.radians(5.0),
     "heading_deadband": math.radians(1.0),
     "realign_angle": math.radians(30.0),
-    "waypoint_tolerance": 0.05,
+    "waypoint_tolerance": 0.02,
     "carrot_spacing": 0.4, "carrot_advance_fraction": 0.90,
     "distance_kp": 1.5,
     "lateral_on": 0.03, "lateral_off": 0.02,
 }
 SIM_CONTROL = {"forward_speed": 1.0, "turn_speed": 2.8,
                "min_turn_speed": 1.5, "min_forward_speed": 0.15}
-REAL_CONTROL = {"forward_speed": 0.4, "turn_speed": 0.4,
+REAL_CONTROL = {"forward_speed": 0.4, "turn_speed": 0.2,
                 "min_turn_speed": 0.0, "min_forward_speed": 0.0}
 
 
 # Checker if it reached grid
 def has_reached_grid(robot_pose, target_cell, origin,
-                     resolution=occupancy_grid_resolution, tolerance=0.05) -> bool:
+                     resolution=occupancy_grid_resolution, tolerance=0.02) -> bool:
     """Return True when BOTH x and y are within tolerance of the cell centre.
 
     robot_pose: world [x, y] or [x, y, heading]; None means no pose yet.
@@ -308,7 +308,7 @@ class WaypointNode(Node):
     def __init__(self, map_array:np.array, goal_list:list, is_simulation:bool=True, origin:tuple=(0.0, 0.0), resolution:float=occupancy_grid_resolution,
                  frame:dict=None, robot_number:int=3, expected_start:tuple=None, calibrate:bool=False, debug_tracking:bool=False):
         super().__init__('waypoint')
-        self.get_logger().info("Starting WaypointNode")
+        self.get_logger().info("Starting WaypointNode, changed")
 
         # Our own arguemnts
         self.is_simulation = is_simulation
@@ -409,7 +409,7 @@ class WaypointNode(Node):
             
         else:
             # Works over SSH without a desktop image viewer.
-            grid.draw_grid_map(waypoints=self.waypoints, path=self.path, save_path="/tmp/robot_map.png", show=False)
+            grid.draw_grid_map(waypoints=self.waypoints, path=self.path, save_path="/tmp/robot_map.png", show=True)
             grid.print_grid_map(waypoints=goal_cells, path=self.path)
 
     def yaw_from_quaternion(self, q):

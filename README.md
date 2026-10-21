@@ -273,7 +273,10 @@ rsync -auvx --delete ~/rb2301_ca2/src/rb2301_ca2 bingda@192.168.1.2NN:~/Download
 
 
 cd ~/Downloads/rb2301_ca2_11
+
 colb
+
+echo $ROS_DOMAIN_ID
 
 3 terminals 
 
@@ -281,11 +284,10 @@ basecontrol          # terminal 1, drives the wheels
 
 vrpn                 # terminal 2, Optitrack poses
 
-cd ~/Downloads/rb2301_ca2_<group> && source install/setup.bash && ros2 run rb2301_ca2 path_planning --run test1     # terminal 3
+cd ~/Downloads/rb2301_ca2_<group> && source install/setup.bash && ros2 run rb2301_ca2 path_planning --run test1 --debug-tracking    # terminal 3
 
 
 ros2 topic list # check for vrpn
-
 
 ### ALIAS
 ~/.bashrc
@@ -301,3 +303,31 @@ Ctrl + X # Exit
 source ~/.bashrc
 
 
+### Plotting (LAPTOP terminal)
+
+sudo apt install python3-matplotlib python3-tk
+
+source install/setup.bash
+
+export ROS_DOMAIN_ID=5 # replace with robot ID
+
+ros2 run rb2301_ca2 tracking plotter
+
+ros2 run rb2301_ca2 tracking_plotter \
+  --map-rotation 90 \
+  --csv tracking_logs/test2_low_speed.csv
+
+## Tuning
+
+| Test / observation | What to adjust first |
+|---|---|
+| Turn on the spot: heading repeatedly overshoots zero while the heading reference stays steady | Reduce heading_kp slightly. |
+| Heading converges too slowly, and turn command is below its limit | Increase heading_kp slightly. |
+| Heading converges slowly, but turn command stays at its limit | Increasing Kp won’t help while saturated. Check REAL_CONTROL["turn_speed"] and actual robot response. |
+| Long straight with a lateral offset: correction is too slow | Reduce carrot_spacing slightly. A closer carrot generally demands a stronger correction. |
+| Long straight: robot weaves left/right while moving | Reduce REAL_CONTROL["forward_speed"] first. If needed, try a larger carrot_spacing. |
+| Short consecutive corners: lateral error carries into the next segment | Reduce forward speed first, giving correction more time. Don’t immediately tighten the 5 cm arrival tolerance. |
+| Near an endpoint: approach is too fast | Reduce distance_kp. This mainly affects the distance-controlled approach region. |
+| Robot starts driving before sufficiently aligned | Reduce align_tolerance slightly. Keep it above heading_deadband. |
+| Tiny heading noise causes repeated small turn commands | Increase heading_deadband slightly, accepting a little more residual heading error. |
+| Rapid CARROT ↔ SEGMENT switching near the lateral threshold | Widen the gap between lateral_on and lateral_off; keep lateral_on > lateral_off. |
