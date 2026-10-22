@@ -232,18 +232,18 @@ def get_heading_error(robot_pose, target):
 # All controller tuning lives here. Angles are radians, distances metres.
 # These are starting values; verify on the robot before increasing speed.
 CONTROL_SETTINGS = {
-    "heading_kp": 3.5, "heading_ki": 0.0, "heading_kd": 0.0,
-    "align_tolerance": math.radians(5.0),
+    "heading_kp": 3.5, "heading_ki": 0.0, "heading_kd": 1.0,
+    "align_tolerance": math.radians(3.0),
     "heading_deadband": math.radians(1.0),
     "realign_angle": math.radians(30.0),
-    "waypoint_tolerance": 0.02,
+    "waypoint_tolerance": 0.015,
     "carrot_spacing": 0.4, "carrot_advance_fraction": 0.90,
-    "distance_kp": 1.5,
-    "lateral_on": 0.03, "lateral_off": 0.02,
-}
+    "distance_kp": 2.0,
+    "lateral_on": 0.02, "lateral_off": 0.01,
+} #     
 SIM_CONTROL = {"forward_speed": 1.0, "turn_speed": 2.8,
                "min_turn_speed": 1.5, "min_forward_speed": 0.15}
-REAL_CONTROL = {"forward_speed": 0.4, "turn_speed": 0.2,
+REAL_CONTROL = {"forward_speed": 0.4, "turn_speed": 0.4,
                 "min_turn_speed": 0.0, "min_forward_speed": 0.0}
 
 
