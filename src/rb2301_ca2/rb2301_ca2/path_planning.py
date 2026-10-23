@@ -141,28 +141,6 @@ def heuristic(cell, goal):
     goal[1] - cell[1]
     )
 
-def astar(grid, start, goal):
-    """Return a shortest grid path from start to goal, or None."""
-    rows, cols = grid.shape
-
-    def is_free(cell):
-        i, j = cell
-        # Check bounds first; negative NumPy indices wrap around.
-        return (
-            0 <= i < rows
-            and 0 <= j < cols
-            and grid[i, j] == 0
-        )
-
-    if not is_free(start) or not is_free(goal):
-        return None
-
-    open_set = {start}   # Discovered cells waiting for expansion
-    closed_set = set()   # Cells already expanded
-    g = {start: 0}       # Best known cost from start to each cell
-    parent = {}         # Previous cell on the best known route
-
-    directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
 def astar(grid, start, goal):
     """Eight-direction A* with a penalty for sharp turns."""
@@ -284,19 +262,19 @@ def get_heading_error(robot_pose, target):
 # All controller tuning lives here. Angles are radians, distances metres.
 # These are starting values; verify on the robot before increasing speed.
 CONTROL_SETTINGS = {
-    "heading_kp": 3.5, "heading_ki": 0.0, "heading_kd": 1.0,
+    "heading_kp": 3.5, "heading_ki": 0.0, "heading_kd": 0.0,
     "align_tolerance": math.radians(3.0),
     "heading_deadband": math.radians(1.0),
     "realign_angle": math.radians(80.0),
     "waypoint_tolerance": 0.015,
-    "carrot_spacing": 0.3, "carrot_advance_fraction": 0.50,
+    "carrot_spacing": 0.2,
     "distance_kp": 2.0,
     "lateral_on": 0.02, "lateral_off": 0.01,
 
-    "corner_tolerance": 0.15,            # Switch 15 cm before a corner
-    "curve_speed": 1.0,                # Start testing at 0.5 m/s 
+    "corner_tolerance": 0.1,            # Switch 15 cm before a corner
+    "curve_speed": 0.2,                # Start testing at 0.5 m/s 
 } #     
-SIM_CONTROL = {"forward_speed": 5.0, "turn_speed": 2.8,
+SIM_CONTROL = {"forward_speed": 4.0, "turn_speed": 2.8,
                "min_turn_speed": 1.5, "min_forward_speed": 0.15}
 REAL_CONTROL = {"forward_speed": 0.4, "turn_speed": 0.4,
                 "min_turn_speed": 0.0, "min_forward_speed": 0.0}
@@ -634,8 +612,6 @@ class WaypointNode(Node):
 
             forward = approach * heading_scale
 
-            heading_scale = max(0.0, 1.0 - abs(error)/cfg["realign_angle"])
-            forward = approach * heading_scale
         return forward, turn
 
     def apply_motion_limits(self, forward, turn): # Not needed anymore 
