@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'path_planning = rb2301_ca2.path_planning:main',
+            'tracking_plotter = rb2301_ca2.tracking_plotter:main'
         ],
     },
 )

@@ -161,7 +161,7 @@ You edit on your laptop and copy the package to the robot. The robot runs Ubuntu
 **1. Make a workspace on the robot** (ssh in as usual). Use your group number so groups don't overwrite each other:
 
 ```bash
-mkdir -p ~/Downloads/rb2301_ca2_<group>/src
+mkdir -p ~/Downloads/rb2301_ca2_11/src
 ```
 
 **2. Copy your package.** Run this on your laptop, in a normal terminal, not in the ssh one. Repeat it every time you change `path_planning.py`:
@@ -261,3 +261,73 @@ tools/irl_calibrate.py         for TAs, see below
 Calibration is done once per maze placement, and again if the maze or Optitrack gets moved. Put a robot on two or more known maze points far apart and read the raw pose with `--calibrate`. Then run `python3 tools/irl_calibrate.py --pair 0.5 0.5 <opti_x> <opti_y> --pair 2.7 2.7 <opti_x> <opti_y>`. The residual should be 1 to 2 cm and it warns above 5 cm. Paste `origin_x`, `origin_y` and `rotation_deg` into `[frame]` in `optitrack_variables.config`. Motive has to stream Z-up.
 
 Rigid bodies are created facing maze +y, which is what `heading_offset_deg = auto` assumes. A robot whose rigid body was made differently gets its own line under `[heading_offsets]` as `<robot number> = <reported heading minus true maze heading>` (robots 7 and 12 are measured). The real-robot speed limit is `max_translate_velocity` in `load_irl_config()` in `path_planning.py`.
+
+
+## Our Shortcuts
+
+ssh bingda@192.168.1.205
+
+mkdir -p ~/Downloads/rb2301_ca2_11/src
+
+rsync -auvx --delete ~/rb2301_ca2/src/rb2301_ca2 bingda@192.168.1.2NN:~/Downloads/rb2301_ca2_11/src
+
+
+cd ~/Downloads/rb2301_ca2_11
+
+colb
+
+echo $ROS_DOMAIN_ID
+
+3 terminals 
+
+basecontrol          # terminal 1, drives the wheels
+
+vrpn                 # terminal 2, Optitrack poses
+
+cd ~/Downloads/rb2301_ca2_<group> && source install/setup.bash && ros2 run rb2301_ca2 path_planning --run test1 --debug-tracking    # terminal 3
+
+
+ros2 topic list # check for vrpn
+
+### ALIAS
+~/.bashrc
+
+alias ca2='cd ~/Downloads/rb2301_ca2_11 && source install/setup.bash && ros2 run rb2301_ca2 path_planning --run test1'
+
+alias ca2sync='rsync -auvx --delete ~/rb2301/src/rb2301_ca2 bingda@192.168.1.2NN:~/Downloads/rb2301_ca2_11/src'
+
+Ctrl + O # Save 
+
+Ctrl + X # Exit
+
+source ~/.bashrc
+
+
+### Plotting (LAPTOP terminal)
+
+sudo apt install python3-matplotlib python3-tk
+
+source install/setup.bash
+
+export ROS_DOMAIN_ID=5 # replace with robot ID
+
+ros2 run rb2301_ca2 tracking plotter
+
+ros2 run rb2301_ca2 tracking_plotter \
+  --map-rotation 90 \
+  --csv tracking_logs/test2_low_speed.csv
+
+## Tuning
+
+| Test / observation | What to adjust first |
+|---|---|
+| Turn on the spot: heading repeatedly overshoots zero while the heading reference stays steady | Reduce heading_kp slightly. |
+| Heading converges too slowly, and turn command is below its limit | Increase heading_kp slightly. |
+| Heading converges slowly, but turn command stays at its limit | Increasing Kp won’t help while saturated. Check REAL_CONTROL["turn_speed"] and actual robot response. |
+| Long straight with a lateral offset: correction is too slow | Reduce carrot_spacing slightly. A closer carrot generally demands a stronger correction. |
+| Long straight: robot weaves left/right while moving | Reduce REAL_CONTROL["forward_speed"] first. If needed, try a larger carrot_spacing. |
+| Short consecutive corners: lateral error carries into the next segment | Reduce forward speed first, giving correction more time. Don’t immediately tighten the 5 cm arrival tolerance. |
+| Near an endpoint: approach is too fast | Reduce distance_kp. This mainly affects the distance-controlled approach region. |
+| Robot starts driving before sufficiently aligned | Reduce align_tolerance slightly. Keep it above heading_deadband. |
+| Tiny heading noise causes repeated small turn commands | Increase heading_deadband slightly, accepting a little more residual heading error. |
+| Rapid CARROT ↔ SEGMENT switching near the lateral threshold | Widen the gap between lateral_on and lateral_off; keep lateral_on > lateral_off. |

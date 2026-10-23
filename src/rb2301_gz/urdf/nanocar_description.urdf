@@ -363,7 +363,7 @@
   </gazebo>
 
   <gazebo reference="front_left_wheel_link">
-    <mu1>1.0</mu1>
+    <mu1>0.0</mu1>
     <mu2>0.0</mu2>
     <kp>500000.0</kp>
     <kd>10.0</kd>
@@ -374,7 +374,7 @@
   </gazebo>
 
   <gazebo reference="front_right_wheel_link">
-    <mu1>1.0</mu1>
+    <mu1>0.0</mu1>
     <mu2>0.0</mu2>
     <kp>500000.0</kp>
     <kd>10.0</kd>
@@ -385,7 +385,7 @@
   </gazebo>
 
   <gazebo reference="back_left_wheel_link">
-    <mu1>1.0</mu1>
+    <mu1>0.0</mu1>
     <mu2>0.0</mu2>
     <kp>500000.0</kp>
     <kd>10.0</kd>
@@ -396,7 +396,7 @@
   </gazebo>
 
   <gazebo reference="back_right_wheel_link">
-    <mu1>1.0</mu1>
+    <mu1>0.0</mu1>
     <mu2>0.0</mu2>
     <kp>500000.0</kp>
     <kd>10.0</kd>
