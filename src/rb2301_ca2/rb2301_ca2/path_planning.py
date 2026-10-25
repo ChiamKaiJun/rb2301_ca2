@@ -135,7 +135,7 @@ def load_irl_config(run:str) -> dict:
 
 # OUR GROUP'S ASTAR ALGO
 def heuristic(cell, goal):
-    """Euclidean straight-line distance to the goal."""
+    """Lower bound on remaining movement cost, measured in grid-cell units."""
     return math.hypot(
     goal[0] - cell[0],
     goal[1] - cell[1]
@@ -143,7 +143,7 @@ def heuristic(cell, goal):
 
 
 def astar(grid, start, goal):
-    """Eight-direction A* with a penalty for sharp turns."""
+    """Minimise movement cost plus turn penalties using eight-direction A*."""
     rows, cols = grid.shape
     turn_weight = 0.1  # Penalty for one 90-degree turn
 
@@ -164,18 +164,16 @@ def astar(grid, start, goal):
         (1, 1), (1, -1), (-1, 1), (-1, -1),
     ]
 
-    # Each state stores: (i, j, incoming_di, incoming_dj).
-    # (0, 0) means no incoming direction at the start.
-    start_state = (*start, 0, 0)
-    open_set = {start_state}
-    closed_set = set()
-    g = {start_state: 0.0}
-    parent = {}
+    start_state = (*start, 0, 0)  # Cell + arrival direction; (0, 0) means no prior heading.
+    open_set = {start_state}  # Discovered states awaiting expansion.
+    closed_set = set()  # Expanded states include arrival direction.
+    g = {start_state: 0.0}  # Movement cost + turn penalties; not distance in metres.
+    parent = {}  # Reconstruct the selected route by backtracking.
 
     while open_set:
         current = min(
             open_set,
-            key=lambda s: g[s] + heuristic(s[:2], goal)
+            key=lambda s: g[s] + heuristic(s[:2], goal)  # Expand the smallest f = g + h.
         )
         open_set.remove(current)
         i, j, old_di, old_dj = current
@@ -196,21 +194,19 @@ def astar(grid, start, goal):
             if not is_free(neighbour):
                 continue
 
-            # A diagonal needs BOTH neighbouring side cells to be free.
-            if di != 0 and dj != 0:
+            if di != 0 and dj != 0:  # Diagonal allowed only if BOTH side cells are free.
                 if (
                     not is_free((i + di, j))
                     or not is_free((i, j + dj))
                 ):
                     continue
 
-            next_state = (*neighbour, di, dj)
+            next_state = (*neighbour, di, dj)  # Arrival direction sets the next turn cost.
 
             if next_state in closed_set:
                 continue
 
-            # 1 for horizontal/vertical; sqrt(2) for diagonal.
-            step_cost = math.hypot(di, dj)
+            step_cost = math.hypot(di, dj)  # Straight = 1; diagonal = sqrt(2).
 
             turn_penalty = 0.0
             if (old_di, old_dj) != (0, 0):
@@ -221,7 +217,7 @@ def astar(grid, start, goal):
 
                 turn_penalty = (
                     turn_weight
-                    * (turn_angle / math.radians(90)) ** 2
+                    * (turn_angle / math.radians(90)) ** 2  # 90 deg costs 0.1; 45 deg costs 0.025.
                 )
 
             new_g = g[current] + step_cost + turn_penalty
@@ -262,21 +258,20 @@ def get_heading_error(robot_pose, target):
 # All controller tuning lives here. Angles are radians, distances metres.
 # These are starting values; verify on the robot before increasing speed.
 CONTROL_SETTINGS = {
-    "heading_kp": 3.5, "heading_ki": 0.0, "heading_kd": 0.0,
-    "align_tolerance": math.radians(3.0),
-    "heading_deadband": math.radians(1.0),
-    "realign_angle": math.radians(80.0),
-    "waypoint_tolerance": 0.015,
-    "carrot_spacing": 0.2,
-    "distance_kp": 2.0,
-    "lateral_on": 0.02, "lateral_off": 0.01,
+    "heading_kp": 3.5, "heading_ki": 0.0, "heading_kd": 0.0,  # P-only with these settings.
+    "align_tolerance": math.radians(3.0),  # ALIGN -> DRIVE threshold.
+    "heading_deadband": math.radians(1.0),  # Zero turn command near alignment.
+    "realign_angle": math.radians(80.0),  # DRIVE -> ALIGN threshold.
+    "waypoint_tolerance": 0.015,  # Final goal: each x/y error must be <= 1.5 cm.
+    "carrot_spacing": 0.2,  # Lookahead beyond projected progress (m).
+    "distance_kp": 2.0,  # Final-goal speed cap = gain * remaining distance.
+    "lateral_on": 0.02, "lateral_off": 0.01,  # Carrot aiming ON at 2 cm, OFF at 1 cm.
 
-    "corner_tolerance": 0.1,            # Switch 15 cm before a corner
-    "curve_speed": 0.2,                # Start testing at 0.5 m/s 
+    "corner_tolerance": 0.1,            # Switch within 10 cm of an intermediate waypoint.
 } #     
-SIM_CONTROL = {"forward_speed": 4.0, "turn_speed": 2.8,
+SIM_CONTROL = {"forward_speed": 0.2, "turn_speed": 2.8,  # Single forward-speed cap (m/s).
                "min_turn_speed": 1.5, "min_forward_speed": 0.15}
-REAL_CONTROL = {"forward_speed": 0.4, "turn_speed": 0.4,
+REAL_CONTROL = {"forward_speed": 0.2, "turn_speed": 0.4,  # Preserves the previous effective cap.
                 "min_turn_speed": 0.0, "min_forward_speed": 0.0}
 
 
@@ -343,7 +338,6 @@ class WaypointNode(Node):
         super().__init__('waypoint')
         self.get_logger().info("Starting WaypointNode, changed")
 
-        # Our own arguemnts
         self.is_simulation = is_simulation
         self.plan_new_path = True  # Flag to start path planning
         self.goal_idx = 0
@@ -362,7 +356,7 @@ class WaypointNode(Node):
         self.tracking_test_only = False
         self._last_control_time = None
 
-        # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
+        # Pose callbacks update self.pose; the timer uses the latest stored pose.
         if self.is_simulation:
             self.subscription = self.create_subscription(Odometry, 'odom', self.odometer_callback, 2)
         else:
@@ -375,7 +369,7 @@ class WaypointNode(Node):
                 qos_profile
                 )
 
-        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10) # Publish to cmd_vel node
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10) # Velocity command topic.
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
         self.goal_list = goal_list
@@ -396,12 +390,12 @@ class WaypointNode(Node):
         self._tracking_debug = None
         self._debug_tracking = None
         self._debug_command = (0.0, 0.0)
-        if debug_tracking:
+        if debug_tracking:  # Set up optional telemetry with --debug-tracking: tracking_debug.py publishes robot data on ROS topics for tracking_plotter.py to display live maps and graphs.
             try:
-                from rb2301_ca2.tracking_debug import TrackingDebug
-                self._tracking_debug = TrackingDebug(self)
+                from rb2301_ca2.tracking_debug import TrackingDebug # Load the optional telemetry publisher.
+                self._tracking_debug = TrackingDebug(self) # Create its ROS publishers using this node.
             except Exception as exc:
-                self.get_logger().error(f"Tracking debug disabled: {exc}")
+                self.get_logger().error(f"Tracking debug disabled: {exc}") # Report setup failure; continue without telemetry.
 
     def _print_calibration(self):
         '''--calibrate: twice a second, print the raw Optitrack pose next to the maze-frame pose and grid cell.'''
@@ -482,7 +476,7 @@ class WaypointNode(Node):
         self._debug_command = (float(x), float(turn))
 
     def reset_tracking(self):
-        """Start a new segment with fresh controller and carrot state."""
+        """Reset tracking for a new goal; ordinary corner transitions skip this."""
         self.mode = "ALIGN"
         self.heading_pid.reset()
         self.correcting_lateral = False
@@ -504,35 +498,30 @@ class WaypointNode(Node):
             return
         self.path = route
         self.waypoints = get_turn_waypoints(route)
-        self.current_waypoint_idx = 1 if len(self.waypoints) > 1 else 0
+        self.current_waypoint_idx = 1 if len(self.waypoints) > 1 else 0  # Skip the start cell.
         self.reset_tracking()
         self.get_logger().info(
             f"Goal {self.goal_idx + 1}: {len(route)-1} grid steps, "
             f"{len(self.waypoints)} waypoints")
 
     def waypoint_reached(self):
-        """Corners and goals still require BOTH coordinates within tolerance."""
+        """Use a distance circle for corners and an x/y tolerance box for goals."""
         idx = self.current_waypoint_idx
 
-        # Intermediate corner: switch before reaching its exact position.
-        if idx < len(self.waypoints) - 1:
+        if idx < len(self.waypoints) - 1:  # Intermediate turning waypoint; final goal checked below.
             target = np.array(grid_to_world(
                 *self.waypoints[idx], self.origin, self.resolution
             ))
 
             distance = np.linalg.norm(target - self.pose[:2])
-            return distance <= self.settings["corner_tolerance"]
+            return distance <= self.settings["corner_tolerance"]  # Within 10 cm, using radial distance.
 
         return has_reached_grid(
             self.pose, self.waypoints[self.current_waypoint_idx], self.origin,
-            self.resolution, tolerance=self.settings["waypoint_tolerance"])
+            self.resolution, tolerance=self.settings["waypoint_tolerance"])  # Final goal: x/y box.
 
     def get_lookahead_info(self):
-        """Advance the carrot at 90% along each carrot interval, never past a corner.
-
-        Progress is projected onto the segment: sideways motion does not count.
-        The final carrot stays at the endpoint until waypoint_reached() succeeds.
-        """
+        """Select the aiming reference using projected progress and lateral hysteresis."""
         idx = self.current_waypoint_idx
         start = np.array(grid_to_world(*self.waypoints[max(0, idx-1)],
                                        self.origin, self.resolution))
@@ -545,21 +534,19 @@ class WaypointNode(Node):
         if length > 1e-9:
             direction = segment / length
             offset = robot - start
-            progress = float(np.clip(np.dot(offset, direction), 0.0, length))
-            lateral = float(direction[0]*offset[1] - direction[1]*offset[0])
+            progress = float(np.clip(np.dot(offset, direction), 0.0, length))  # Along-track projection.
+            lateral = float(direction[0]*offset[1] - direction[1]*offset[0])  # Positive = left of path.
             self.carrot_to = min(
-                length, progress + self.settings["carrot_spacing"]
+                length, progress + self.settings["carrot_spacing"]  # Continuous lookahead, capped at end.
             )
             target = start + self.carrot_to * direction
 
-        # This hysteresis selects carrot aiming versus parallel-to-segment aiming.
-        # It is independent of the ALIGN/DRIVE hysteresis in calculate_motion().
-        if abs(lateral) >= self.settings["lateral_on"]:
+        if abs(lateral) >= self.settings["lateral_on"]:  # Enable correction at 2 cm.
             self.correcting_lateral = True
-        elif abs(lateral) <= self.settings["lateral_off"]:
+        elif abs(lateral) <= self.settings["lateral_off"]:  # Disable at 1 cm; otherwise retain state.
             self.correcting_lateral = False
         at_endpoint = self.carrot_to >= length
-        use_carrot = self.correcting_lateral or at_endpoint
+        use_carrot = self.correcting_lateral or at_endpoint  # Endpoint overrides lateral hysteresis.
         heading_source = "ENDPOINT" if at_endpoint else (
             "CARROT" if self.correcting_lateral else "SEGMENT")
         delta = target - robot
@@ -577,44 +564,39 @@ class WaypointNode(Node):
         cfg = self.settings
         error = tracking["heading_error"]
         old_mode = self.mode
-        if self.mode == "ALIGN" and abs(error) <= cfg["align_tolerance"]:
+        if self.mode == "ALIGN" and abs(error) <= cfg["align_tolerance"]:  # Drive once aligned within 3 deg.
             self.mode = "DRIVE"
-        elif self.mode == "DRIVE" and abs(error) >= cfg["realign_angle"]:
+        elif self.mode == "DRIVE" and abs(error) >= cfg["realign_angle"]:  # Stop to realign at 80 deg.
             self.mode = "ALIGN"
-        if self.mode != old_mode:
+        if self.mode != old_mode:  # Discard PID history on mode changes.
             self.heading_pid.reset()
             self.get_logger().info(
                 f"{old_mode} -> {self.mode}: heading error {math.degrees(error):+.1f} deg")
 
-        if abs(error) <= cfg["heading_deadband"]:
+        if abs(error) <= cfg["heading_deadband"]:  # Suppress steering jitter within 1 deg.
             self.heading_pid.reset()
             turn = 0.0
         else:
             turn = self.heading_pid.compute(error, dt)
-        forward = 0.0
+        forward = 0.0  # ALIGN turns in place; forward motion is enabled only in DRIVE.
         if self.mode == "DRIVE":
-            approach = min(
-                cfg["forward_speed"],
-                cfg["curve_speed"]
-            )
-
-            # Slow down for the final destination only.
-            if self.current_waypoint_idx == len(self.waypoints) - 1:
-                approach = min(
-                    approach,
-                    cfg["distance_kp"] * tracking["distance_to_endpoint"]
+            target_speed = cfg["forward_speed"]  # Base speed cap; corners do not trigger distance slowdown.
+            if self.current_waypoint_idx == len(self.waypoints) - 1:  # Brake as the final goal gets closer.
+                target_speed = min(
+                    target_speed,
+                    cfg["distance_kp"] * tracking["distance_to_endpoint"]  # P distance control, capped above.
                 )
 
-            heading_scale = max(
+            heading_scale = max(  # Scale from 1 when aligned to 0 at the realignment threshold.
                 0.0,
                 1.0 - abs(error) / cfg["realign_angle"]
             )
 
-            forward = approach * heading_scale
+            forward = target_speed * heading_scale  # Combine goal approach speed with heading correction.
 
         return forward, turn
 
-    def apply_motion_limits(self, forward, turn): # Not needed anymore 
+    def apply_motion_limits(self, forward, turn): # Not used anymore, Currently bypassed in _control_step(), Simulation previously could not show low turn speeds
         """Keep the professor's simulation workaround outside the PID math.
 
         Zero commands always remain zero. Real-robot minimums default to zero.
@@ -629,17 +611,17 @@ class WaypointNode(Node):
                 float(np.clip(turn, -cfg["turn_speed"], cfg["turn_speed"])))
 
     def advance_waypoint(self):
+        """Continue through a corner, or stop and prepare the next goal."""
 
-        if self.current_waypoint_idx < len(self.waypoints) - 1:
-            self.current_waypoint_idx += 1
+        if self.current_waypoint_idx < len(self.waypoints) - 1: # If last waypoint not yet reached
+            self.current_waypoint_idx += 1  # Next segment; retain mode, PID and lateral state.
 
-            # Restart the carrot on the next segment.
             self.carrot_from = 0.0
             self.carrot_to = self.settings["carrot_spacing"]
 
-            return
+            return  # Keep the previous velocity until the next control cycle.
         
-        self.move_2D()
+        self.move_2D()  # Stop at the goal; no timed pause is implemented.
         self.current_waypoint_idx += 1
         if self.current_waypoint_idx >= len(self.waypoints):
             self.goal_idx += 1
@@ -651,13 +633,14 @@ class WaypointNode(Node):
     def timer_callback(self):
         """Keep optional debug failures outside the motion-control logic."""
         self._debug_tracking = None
-        self._control_step()
-        if self._tracking_debug is not None:
+        self._control_step()  # Motion first; optional debug also runs on transition cycles.
+        if self._tracking_debug is not None: # Publish only when the optional debug publisher is active.
             try:
-                self._tracking_debug.publish(self._debug_tracking, self._debug_command)
+                # Publish tracking data and velocity commands via tracking_debug.py; tracking_plotter.py receives them for the laptop's live map and graphs.
+                self._tracking_debug.publish(self._debug_tracking, self._debug_command) 
             except Exception as exc:
-                self.get_logger().error(f"Tracking debug disabled: {exc}")
-                self._tracking_debug = None
+                self.get_logger().error(f"Tracking debug disabled: {exc}")  # Report why telemetry publishing failed.
+                self._tracking_debug = None  # Disable debug on failure; keep control running.
 
     def _control_step(self):
         """Mission checks -> tracking geometry -> motion controller -> publish."""
@@ -682,16 +665,16 @@ class WaypointNode(Node):
         if not self.waypoints:
             self.move_2D()
             return
-        if self.waypoint_reached():
+        if self.waypoint_reached():  # Arrival is checked BEFORE tracking and control.
             self.advance_waypoint()
             return
 
         now = self.get_clock().now().nanoseconds * 1e-9
         dt = 0.0 if self._last_control_time is None else now - self._last_control_time
         self._last_control_time = now
-        tracking = self.get_lookahead_info()
+        tracking = self.get_lookahead_info()  # Select carrot aiming reference and calculate errors.
         self._debug_tracking = tracking
-        forward, raw_turn = self.calculate_motion(tracking, dt)
+        forward, raw_turn = self.calculate_motion(tracking, dt)  # Update mode; compute velocity commands.
         #forward, turn = self.apply_motion_limits(forward, raw_turn)
         turn=raw_turn 
         if self.tracking_test_only:

@@ -24,14 +24,13 @@ class PIDController:
                                 min(self.integral_limit, self.integral + error * dt))
             if self.prev_error is not None:
                 change = error - self.prev_error
-                if self.angular:
+                if self.angular:  # Wrap changes across +/-pi before differentiation.
                     change = (change + math.pi) % (2.0 * math.pi) - math.pi
                 derivative = change / dt
         output = self.kp*error + self.ki*candidate + self.kd*derivative
-        # Integrate only if not driving further into output saturation.
-        if abs(output) <= self.output_limit or output * (self.ki*error) < 0.0:
+        if abs(output) <= self.output_limit or output * (self.ki*error) < 0.0:  # Anti-windup.
             self.integral = candidate
         else:
             output = self.kp*error + self.ki*self.integral + self.kd*derivative
         self.prev_error = error
-        return max(-self.output_limit, min(self.output_limit, output))
+        return max(-self.output_limit, min(self.output_limit, output))  # Saturate final output.

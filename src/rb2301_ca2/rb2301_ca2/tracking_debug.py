@@ -1,4 +1,4 @@
-"""Small, optional telemetry publisher. No plotting imports on the robot."""
+"""Used with --debug-tracking to publish robot pose, tracking errors and velocity commands for live maps, graphs and logs."""
 import json
 import math
 import uuid
@@ -7,11 +7,11 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from std_msgs.msg import String
 
 
-def sample_qos():
+def sample_qos():  # Best-effort delivery for changing live samples.
     return QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
 
 
-def scene_qos():
+def scene_qos():  # Retain the scene for late-joining viewers.
     return QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                       durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
@@ -26,10 +26,10 @@ class TrackingDebug:
         self.scene = node.create_publisher(String, 'tracking/scene', scene_qos())
 
     def publish(self, tracking, command):
-        """Called after a control tick; use its actual geometry and sent command."""
+        """Publish control-cycle geometry and commands, not measured velocities."""
         n = self.node
         route = (tuple(n.path), tuple(n.waypoints))
-        if route != self.last_route:
+        if route != self.last_route:  # Publish scene only when the route changes.
             # The grid uses [x, y], which the viewer transposes for imshow.
             scene = dict(run_id=self.run_id, grid=n.map_array.tolist(),
                          origin=list(n.origin), resolution=n.resolution,
@@ -47,7 +47,7 @@ class TrackingDebug:
         elif not n.waypoints:
             status = 'NO_PATH'
         elif tracking is None:
-            status = 'TRANSITION'
+            status = 'TRANSITION'  # No geometry calculated during planning/arrival.
         else:
             status = n.mode
         sample = dict(run_id=self.run_id, seq=self.sequence,
@@ -59,7 +59,7 @@ class TrackingDebug:
                       forward=command[0], turn=command[1], source='NONE',
                       heading=None, lateral=None, target=None)
         if tracking is not None:
-            sample.update(heading=math.degrees(tracking['heading_error']),
+            sample.update(heading=math.degrees(tracking['heading_error']),  # Degrees; lateral is metres.
                           lateral=tracking['lateral_error'],
                           target=tracking['target'].tolist(),
                           source=tracking['heading_source'])
